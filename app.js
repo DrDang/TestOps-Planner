@@ -20,17 +20,25 @@ const sampleData = {
   programs: ["Program Alpha", "Program Beta", "Program Orion", "Program Lumen"],
   uuts: ["UUT-001", "UUT-002", "UUT-003", "Payload A", "Flight Unit 2"],
   assets: [
-    asset("A-001", "RF Station 1", "Station", true, "RF Lab", "Test Engineering", "Available", false, 1, false, ""),
-    asset("A-002", "Thermal Chamber East", "Chamber", false, "Environmental Lab", "Env Test", "Available", false, 1, true, "2026-09-15"),
-    asset("A-003", "Spectrum Analyzer SA-001", "Spectrum Analyzer", false, "RF Lab", "Metrology", "Available", false, 1, true, "2026-08-01"),
-    asset("A-004", "10 MHz Reference", "Timing Reference", false, "RF Lab", "Test Engineering", "Available", true, 3, true, "2027-01-10"),
-    asset("A-005", "ESS Station", "Station", true, "Environmental Lab", "Env Test", "Available", false, 1, false, ""),
-    asset("A-006", "EMI Receiver", "EMI Equipment", false, "Compliance Lab", "Compliance", "Out for Calibration", false, 1, true, "2026-06-20"),
-    asset("A-007", "Power Supply Stack", "Power Supply", false, "Bench 4", "Test Engineering", "Available", false, 2, true, "2026-11-30"),
-    asset("A-008", "Integration Bench 2", "Station", true, "Systems Lab", "Systems", "Available", false, 1, false, "")
+    asset("A-001", "RF Station 1", "Station", true, "RF Lab", "Test Engineering", "Available", 1, false, ""),
+    asset("A-002", "Thermal Chamber East", "Chamber", false, "Environmental Lab", "Env Test", "Available", 1, true, "2026-09-15"),
+    asset("A-003", "Spectrum Analyzer SA-001", "Spectrum Analyzer", false, "RF Lab", "Metrology", "Available", 1, true, "2026-08-01"),
+    asset("A-004", "10 MHz Reference", "Timing Reference", false, "RF Lab", "Test Engineering", "Available", 3, true, "2027-01-10"),
+    asset("A-005", "ESS Station", "Station", true, "Environmental Lab", "Env Test", "Available", 1, false, ""),
+    asset("A-006", "EMI Receiver", "EMI Equipment", false, "Compliance Lab", "Compliance", "Out for Calibration", 1, true, "2026-06-20"),
+    asset("A-007", "Power Supply Stack", "Power Supply", false, "Bench 4", "Test Engineering", "Available", 2, true, "2026-11-30"),
+    asset("A-009", "5VDC Bench Supply", "5VDC Power Supply", false, "Bench 2", "Test Engineering", "Available", 1, true, "2026-12-15"),
+    asset("A-010", "Oscilloscope MSO-4", "Oscilloscope", false, "Bench 2", "Metrology", "Available", 1, true, "2026-10-05"),
+    asset("A-008", "Integration Bench 2", "Station", true, "Systems Lab", "Systems", "Available", 1, false, "")
   ],
   testEvents: [
-    event("T-001", "Avionics RF Checkout", "Program Alpha", "UUT-001", "RF Checkout", "2026-07-08", "2026-07-12", "A-001", ["A-003", "A-004", "A-007"], "High", "Test Engineering", "Planned"),
+    event("T-001", "Avionics RF Checkout", "Program Alpha", "UUT-001", "RF Checkout", "2026-07-08", "2026-07-12", "A-001", ["A-003", "A-004", "A-007", "A-009", "A-010"], "High", "Test Engineering", "Planned", [
+      equipmentRole("R-001", "Spectrum analyzer", "Spectrum Analyzer", 1, ["A-003"]),
+      equipmentRole("R-002", "Timing reference", "Timing Reference", 1, ["A-004"]),
+      equipmentRole("R-003", "DC power", "Power Supply", 1, ["A-007"]),
+      equipmentRole("R-004", "5VDC supply", "5VDC Power Supply", 1, ["A-009"]),
+      equipmentRole("R-005", "Scope", "Oscilloscope", 1, ["A-010"])
+    ]),
     event("T-002", "Payload Thermal Cycle", "Program Orion", "Payload A", "ESS", "2026-07-10", "2026-07-18", "A-005", ["A-002", "A-007"], "Critical", "Env Test", "Approved"),
     event("T-003", "EMI Pre-Scan", "Program Beta", "UUT-002", "EMI", "2026-07-09", "2026-07-11", "A-008", ["A-006", "A-004"], "Medium", "Compliance", "Planned"),
     event("T-004", "RF Regression", "Program Beta", "UUT-003", "RF Checkout", "2026-07-10", "2026-07-14", "A-001", ["A-003", "A-004"], "High", "Test Engineering", "Planned"),
@@ -46,12 +54,16 @@ let selectedAssetId = "";
 let selectedEventId = "";
 let activeView = "schedule";
 
-function asset(id, name, assetType, isStation, location, owner, status, shareable, maxConcurrentUses, calibrationRequired, calibrationDueDate) {
-  return { id, name, assetType, isStation, quantity: maxConcurrentUses, serialNumber: "", location, owner, status, shareable, maxConcurrentUses, calibrationRequired, calibrationDueDate, notes: "" };
+function asset(id, name, assetType, isStation, location, owner, status, maxConcurrentUses, calibrationRequired, calibrationDueDate) {
+  return { id, name, assetType, isStation, quantity: maxConcurrentUses, serialNumber: "", location, owner, status, maxConcurrentUses, calibrationRequired, calibrationDueDate, notes: "" };
 }
 
-function event(id, name, program, uut, testType, startDate, endDate, stationAssetId, requiredAssetIds, priority, owner, status) {
-  return { id, name, program, uut, testType, startDate, endDate, stationAssetId, requiredAssetIds, priority, owner, status, notes: "" };
+function event(id, name, program, uut, testType, startDate, endDate, stationAssetId, requiredAssetIds, priority, owner, status, equipmentRoles = []) {
+  return { id, name, program, uut, testType, startDate, endDate, stationAssetId, requiredAssetIds, equipmentRoles, priority, owner, status, notes: "" };
+}
+
+function equipmentRole(id, label, assetType, quantity = 1, assignedAssetIds = []) {
+  return { id, label, assetType, quantity, assignedAssetIds };
 }
 
 function loadState() {
@@ -78,20 +90,52 @@ function normalizeState(data) {
 }
 
 function reconcileState(nextState = state) {
-  nextState.assets = nextState.assets.map(({ assetTag, ...assetItem }) => assetItem);
+  nextState.assets = nextState.assets.map(({ assetTag, shareable, ...assetItem }) => assetItem);
   const validAssetIds = new Set(nextState.assets.map((item) => item.id));
   const stationIds = new Set(nextState.assets.filter((item) => item.isStation).map((item) => item.id));
+  const assetsById = byId(nextState.assets);
   nextState.testEvents = nextState.testEvents.map((testEvent) => {
     const stationAssetId = stationIds.has(testEvent.stationAssetId) ? testEvent.stationAssetId : "";
+    const legacyEquipmentIds = [...new Set((testEvent.requiredAssetIds || []).filter((assetId) => validAssetIds.has(assetId) && assetId !== stationAssetId))];
+    const equipmentRoles = normalizeEquipmentRoles(testEvent.equipmentRoles, legacyEquipmentIds, assetsById);
+    const assignedEquipmentIds = equipmentRoles.flatMap((role) => role.assignedAssetIds || []);
     return {
       ...testEvent,
       stationAssetId,
-      requiredAssetIds: [...new Set([stationAssetId, ...(testEvent.requiredAssetIds || [])].filter((assetId) => validAssetIds.has(assetId)))]
+      equipmentRoles,
+      requiredAssetIds: [...new Set([stationAssetId, ...assignedEquipmentIds].filter((assetId) => validAssetIds.has(assetId)))]
     };
   });
   nextState.programs = unique([...(nextState.programs || []), ...nextState.testEvents.map((item) => item.program)]);
   nextState.uuts = unique([...(nextState.uuts || []), ...nextState.testEvents.map((item) => item.uut)]);
   return nextState;
+}
+
+function normalizeEquipmentRoles(roles, legacyEquipmentIds, assetsById) {
+  const validAssetIds = new Set(assetsById.keys());
+  if (Array.isArray(roles) && roles.length) {
+    return roles.map((role, index) => {
+      const quantity = Math.max(1, Number(role.quantity) || 1);
+      const incomingAssignedIds = [...new Set((role.assignedAssetIds || []).filter((assetId) => validAssetIds.has(assetId)))];
+      const firstAssigned = assetsById.get(incomingAssignedIds[0]);
+      const assetType = String(role.assetType || firstAssigned?.assetType || "").trim();
+      const assignedAssetIds = incomingAssignedIds.filter((assetId) => {
+        const assetItem = assetsById.get(assetId);
+        return assetItem && (!assetType || assetItem.assetType === assetType);
+      }).slice(0, quantity);
+      return {
+        id: role.id || `R-${String(index + 1).padStart(3, "0")}`,
+        label: String(role.label || assetType || "Equipment role").trim(),
+        assetType,
+        quantity,
+        assignedAssetIds
+      };
+    });
+  }
+  return legacyEquipmentIds.map((assetId, index) => {
+    const assetItem = assetsById.get(assetId);
+    return equipmentRole(`R-${String(index + 1).padStart(3, "0")}`, assetItem?.assetType || assetItem?.name || "Equipment", assetItem?.assetType || "", 1, [assetId]);
+  });
 }
 
 function saveState() {
@@ -125,6 +169,33 @@ function overlapRange(a, b) {
 
 function fullAssetIds(testEvent) {
   return [...new Set([testEvent.stationAssetId, ...(testEvent.requiredAssetIds || [])].filter(Boolean))];
+}
+
+function roleFillCount(role) {
+  return (role.assignedAssetIds || []).filter(Boolean).length;
+}
+
+function roleSummary(testEvent) {
+  const roles = testEvent.equipmentRoles || [];
+  if (!roles.length) return "No equipment roles";
+  const assigned = roles.reduce((sum, role) => sum + roleFillCount(role), 0);
+  const needed = roles.reduce((sum, role) => sum + (Number(role.quantity) || 1), 0);
+  return `${roles.length} role${roles.length === 1 ? "" : "s"} / ${assigned} of ${needed} assigned`;
+}
+
+function equipmentTypeOptions() {
+  return unique([
+    ...(state.settings.equipmentTypes || []),
+    ...state.assets.filter((assetItem) => !assetItem.isStation).map((assetItem) => assetItem.assetType),
+    ...state.testEvents.flatMap((testEvent) => (testEvent.equipmentRoles || []).map((role) => role.assetType))
+  ]);
+}
+
+function rememberEquipmentType(assetType) {
+  const normalized = String(assetType || "").trim();
+  if (!normalized) return "";
+  state.settings.equipmentTypes = unique([...(state.settings.equipmentTypes || []), normalized]);
+  return normalized;
 }
 
 function assetIdentity(assetItem) {
@@ -311,6 +382,25 @@ function detectConflicts(events = state.testEvents) {
   });
 
   events.forEach((testEvent) => {
+    (testEvent.equipmentRoles || []).forEach((role) => {
+      const quantity = Number(role.quantity) || 1;
+      const assignedCount = roleFillCount(role);
+      if (assignedCount < quantity) {
+        addConflict({
+          conflictType: "Unassigned Equipment",
+          assetId: "",
+          uut: "",
+          startDate: testEvent.startDate,
+          endDate: testEvent.endDate,
+          eventIds: [testEvent.id],
+          programs: [testEvent.program].filter(Boolean),
+          severity: testEvent.priority === "Critical" ? "High" : "Medium",
+          explanation: `${testEvent.name} needs ${quantity} ${role.assetType || role.label || "equipment"} role${quantity === 1 ? "" : "s"}, but only ${assignedCount} ${assignedCount === 1 ? "is" : "are"} assigned.`,
+          suggestedResolution: "Assign matching inventory, add inventory capacity, or revise the role quantity."
+        });
+      }
+    });
+
     fullAssetIds(testEvent).forEach((assetId) => {
       const usedAsset = assetsById.get(assetId);
       if (!usedAsset) return;
@@ -470,7 +560,7 @@ function renderAssetForm() {
       ${input("Asset Name", "name", item.name)}
     </div>
     <div class="form-row">
-      ${input("Asset Type", "assetType", item.assetType)}
+      ${assetTypeInput(item.assetType)}
       ${input("Quantity", "quantity", item.quantity, "number")}
     </div>
     <div class="form-row">
@@ -489,7 +579,6 @@ function renderAssetForm() {
       <div class="field">
         <label>Flags</label>
         <div class="checkbox-row"><input id="asset-isStation" name="isStation" type="checkbox" ${item.isStation ? "checked" : ""}><span>Is Station?</span></div>
-        <div class="checkbox-row"><input id="asset-shareable" name="shareable" type="checkbox" ${item.shareable ? "checked" : ""}><span>Shareable?</span></div>
         <div class="checkbox-row"><input id="asset-calibrationRequired" name="calibrationRequired" type="checkbox" ${item.calibrationRequired ? "checked" : ""}><span>Calibration Required?</span></div>
       </div>
     </div>
@@ -530,8 +619,9 @@ function renderEventForm() {
     </div>
     ${input("Owner", "owner", item.owner)}
     <div class="field">
-      <label>Required Equipment From Inventory</label>
-      <div id="eventAssetPicker" class="asset-picker"></div>
+      <label>Equipment Roles</label>
+      <div id="eventEquipmentRoles" class="role-list"></div>
+      <button type="button" class="secondary" id="addEquipmentRoleBtn">Add Equipment Role</button>
     </div>
     ${textarea("Notes", "notes", item.notes)}
     <div class="form-actions">
@@ -539,51 +629,165 @@ function renderEventForm() {
       <button type="button" class="secondary" id="cancelEventBtn">Cancel</button>
     </div>
   `;
-  refreshEventAssetPicker();
+  refreshEventEquipmentRoles();
 }
 
-function refreshEventAssetPicker() {
-  const picker = document.getElementById("eventAssetPicker");
-  if (!picker) return;
+function refreshEventEquipmentRoles() {
+  const target = document.getElementById("eventEquipmentRoles");
+  if (!target) return;
   const eventId = formValue(new FormData(document.getElementById("eventForm")), "id");
   const startDate = value("event-startDate");
   const endDate = value("event-endDate");
-  const renderedCheckboxes = [...document.querySelectorAll('input[name="requiredAssetIds"]')];
-  const selectedIds = new Set(
-    renderedCheckboxes.filter((inputEl) => inputEl.checked).map((inputEl) => inputEl.value)
-  );
-  const currentEvent = state.testEvents.find((eventItem) => eventItem.id === eventId);
-  if (!renderedCheckboxes.length) {
-    (currentEvent?.requiredAssetIds || []).forEach((assetId) => selectedIds.add(assetId));
-  }
-  const stationAssetId = value("event-stationAssetId");
-  selectedIds.delete(stationAssetId);
-  const equipment = state.assets.filter((assetItem) => !assetItem.isStation);
-
-  if (!equipment.length) {
-    picker.innerHTML = `<div class="empty compact-empty"><h3>No equipment in inventory</h3><p>Add assets first, then assign them here.</p></div>`;
+  const roles = readEquipmentRolesFromForm();
+  if (!roles.length) {
+    target.innerHTML = `<div class="empty compact-empty"><h3>No equipment roles</h3><p>Add a role such as 5VDC power supply, oscilloscope, chamber, or fixture.</p></div>`;
     return;
   }
+  target.innerHTML = `${equipmentRoleHeader()}${roles.map((role, index) => renderEquipmentRole(role, index, startDate, endDate, eventId)).join("")}`;
+}
 
-  picker.innerHTML = equipment.map((assetItem) => {
-    const allocation = assetAllocation(assetItem.id, startDate, endDate, eventId);
-    const checked = selectedIds.has(assetItem.id) ? "checked" : "";
-    const capacity = Number(assetItem.maxConcurrentUses || assetItem.quantity || 1);
-    return `
-      <label class="asset-choice ${allocation.level}">
-        <input type="checkbox" name="requiredAssetIds" value="${escapeHtml(assetItem.id)}" ${checked}>
-        <span class="asset-choice-main">
-          <strong>${escapeHtml(assetItem.name || "Unnamed asset")}</strong>
-          <span>${escapeHtml(assetItem.assetType || "Asset")} / ${escapeHtml(assetIdentity(assetItem))}</span>
-          <small>${escapeHtml(assetItem.location || "No location")} / Capacity ${capacity}</small>
-        </span>
-        <span class="asset-choice-status">
-          <b>${escapeHtml(allocation.label)}</b>
-          <small>${escapeHtml(allocation.detail)}</small>
-        </span>
-      </label>
-    `;
-  }).join("");
+function renderEquipmentRole(role, index, startDate, endDate, eventId) {
+  const typeOptions = equipmentTypeOptions();
+  const matchingAssets = state.assets.filter((assetItem) => !assetItem.isStation && assetItem.assetType === role.assetType);
+  const quantity = Math.max(1, Number(role.quantity) || 1);
+  const assigned = [...new Set(role.assignedAssetIds || [])].slice(0, quantity);
+  const openSlots = Array.from({ length: quantity }, (_, slotIndex) => assigned[slotIndex] || "");
+  const statusClass = assigned.filter(Boolean).length >= quantity ? "ok" : "medium";
+  const matchText = role.assetType ? `${matchingAssets.length} match${matchingAssets.length === 1 ? "" : "es"}` : "Set type";
+  return `
+    <section class="equipment-role" data-role-index="${index}">
+      <input type="hidden" name="equipmentRoleId[]" value="${escapeHtml(role.id)}">
+      <input type="hidden" name="equipmentRoleLabel[]" value="${escapeHtml(role.assetType || role.label || "")}">
+      <div class="role-type-cell">
+        ${roleInputWithDatalist("Type", "equipmentRoleType[]", role.assetType, typeOptions, index)}
+      </div>
+      ${roleInput("Qty", "equipmentRoleQuantity[]", quantity, index, "number")}
+      <div class="role-assignment-cell">
+        ${openSlots.map((assetId, slotIndex) => renderRoleAssignment(role, index, slotIndex, assetId, matchingAssets, startDate, endDate, eventId)).join("")}
+      </div>
+      <div class="role-status-cell">${badge(`${assigned.filter(Boolean).length}/${quantity}`, statusClass)}<small>${escapeHtml(matchText)}</small></div>
+      <button type="button" class="secondary icon-button" data-remove-equipment-role="${index}" aria-label="Remove equipment role">X</button>
+    </section>
+  `;
+}
+
+function equipmentRoleHeader() {
+  return `
+    <div class="role-list-header" aria-hidden="true">
+      <span>Type</span>
+      <span>Qty</span>
+      <span>Assignment</span>
+      <span>Filled</span>
+      <span></span>
+    </div>
+  `;
+}
+
+function renderRoleAssignment(role, roleIndex, slotIndex, assetId, matchingAssets, startDate, endDate, eventId) {
+  const selectedAsset = state.assets.find((assetItem) => assetItem.id === assetId);
+  const selectedMatchesRole = selectedAsset && (!role.assetType || selectedAsset.assetType === role.assetType);
+  const options = matchingAssets.some((assetItem) => assetItem.id === assetId) || !selectedMatchesRole ? matchingAssets : [selectedAsset, ...matchingAssets];
+  const selectedAllocation = assetId ? assetAllocation(assetId, startDate, endDate, eventId) : null;
+  return `
+    <div class="role-assignment">
+      <div class="field">
+        <label class="sr-only" for="role-${roleIndex}-slot-${slotIndex}">Assignment ${slotIndex + 1}</label>
+        <select id="role-${roleIndex}-slot-${slotIndex}" name="equipmentRoleAssignedAssetIds[]">
+          <option value="" data-role-index="${roleIndex}">Unassigned ${escapeHtml(role.assetType || "equipment")}</option>
+          ${options.map((assetItem) => {
+            const allocation = assetAllocation(assetItem.id, startDate, endDate, eventId);
+            const status = allocation.level === "open" ? "" : ` (${allocation.label})`;
+            return `<option value="${escapeHtml(assetItem.id)}" data-role-index="${roleIndex}" ${assetItem.id === assetId ? "selected" : ""}>${escapeHtml(assetOptionLabel(assetItem))}${escapeHtml(status)}</option>`;
+          }).join("")}
+        </select>
+      </div>
+      <small class="${selectedAllocation ? `assignment-${selectedAllocation.level}` : ""}">${escapeHtml(selectedAllocation?.detail || "Select a matching inventory item later, or leave this role unresolved.")}</small>
+    </div>
+  `;
+}
+
+function roleInput(labelText, name, inputValue, index, type = "text") {
+  return `<div class="field compact-role-field"><label class="sr-only" for="role-${index}-${name.replace(/\W/g, "")}">${labelText}</label><input id="role-${index}-${name.replace(/\W/g, "")}" name="${name}" type="${type}" min="1" value="${escapeHtml(inputValue ?? "")}"></div>`;
+}
+
+function roleInputWithDatalist(labelText, name, inputValue, options, index) {
+  const choices = unique([inputValue, ...options]);
+  return `
+    <div class="field compact-role-field">
+      <label class="sr-only" for="role-${index}-type">${labelText}</label>
+      <select id="role-${index}-type" name="${name}" data-current-type="${escapeHtml(inputValue || "")}">
+        <option value="">Select type</option>
+        ${choices.map((option) => `<option value="${escapeHtml(option)}" ${option === inputValue ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+        <option value="__new_equipment_type__">New type...</option>
+      </select>
+    </div>
+  `;
+}
+
+function readEquipmentRolesFromForm() {
+  const formEl = document.getElementById("eventForm");
+  if (!formEl) return [];
+  const eventId = formValue(new FormData(formEl), "id");
+  const currentEvent = state.testEvents.find((eventItem) => eventItem.id === eventId);
+  const roleIds = [...formEl.querySelectorAll('input[name="equipmentRoleId[]"]')];
+  if (!roleIds.length) return structuredClone(currentEvent?.equipmentRoles || []);
+
+  const labels = [...formEl.querySelectorAll('input[name="equipmentRoleLabel[]"]')];
+  const types = [...formEl.querySelectorAll('[name="equipmentRoleType[]"]')];
+  const quantities = [...formEl.querySelectorAll('input[name="equipmentRoleQuantity[]"]')];
+  const assignmentsByRole = new Map();
+  [...formEl.querySelectorAll('select[name="equipmentRoleAssignedAssetIds[]"]')].forEach((selectEl) => {
+    const roleIndex = Number(selectEl.selectedOptions[0]?.dataset.roleIndex || selectEl.querySelector("option")?.dataset.roleIndex || 0);
+    if (!assignmentsByRole.has(roleIndex)) assignmentsByRole.set(roleIndex, []);
+    if (selectEl.value) assignmentsByRole.get(roleIndex).push(selectEl.value);
+  });
+  return roleIds.map((idInput, index) => {
+    const assetType = types[index]?.value.trim() || "";
+    const quantity = Math.max(1, Number(quantities[index]?.value) || 1);
+    const assignedAssetIds = [...new Set(assignmentsByRole.get(index) || [])].filter((assetId) => {
+      const assetItem = state.assets.find((item) => item.id === assetId);
+      return assetItem && (!assetType || assetItem.assetType === assetType);
+    });
+    return {
+      id: idInput.value || nextRoleId(index),
+      label: assetType || labels[index]?.value.trim() || "Equipment role",
+      assetType,
+      quantity,
+      assignedAssetIds
+    };
+  });
+}
+
+function nextRoleId(offset = 0) {
+  const formEl = document.getElementById("eventForm");
+  const roles = formEl ? [...formEl.querySelectorAll('input[name="equipmentRoleId[]"]')].map((inputEl) => ({ id: inputEl.value })) : [];
+  const highest = roles.reduce((max, role) => Math.max(max, Number(String(role.id).replace("R-", "")) || 0), 0);
+  return `R-${String(highest + offset + 1).padStart(3, "0")}`;
+}
+
+function addEquipmentRole() {
+  const roles = readEquipmentRolesFromForm();
+  const nextIndex = roles.length;
+  roles.push(equipmentRole(nextRoleId(), "", "", 1, []));
+  renderEquipmentRolesFrom(roles);
+  document.getElementById(`role-${nextIndex}-type`)?.focus();
+}
+
+function removeEquipmentRole(index) {
+  const roles = readEquipmentRolesFromForm();
+  roles.splice(index, 1);
+  renderEquipmentRolesFrom(roles);
+}
+
+function renderEquipmentRolesFrom(roles) {
+  const target = document.getElementById("eventEquipmentRoles");
+  if (!target) return;
+  const eventId = formValue(new FormData(document.getElementById("eventForm")), "id");
+  const startDate = value("event-startDate");
+  const endDate = value("event-endDate");
+  target.innerHTML = roles.length
+    ? `${equipmentRoleHeader()}${roles.map((role, index) => renderEquipmentRole(role, index, startDate, endDate, eventId)).join("")}`
+    : `<div class="empty compact-empty"><h3>No equipment roles</h3><p>Add a role such as 5VDC power supply, oscilloscope, chamber, or fixture.</p></div>`;
 }
 
 function input(labelText, name, inputValue, type = "text", disabled = false) {
@@ -594,6 +798,11 @@ function input(labelText, name, inputValue, type = "text", disabled = false) {
 function inputWithDatalist(labelText, name, inputValue, options) {
   const listId = `event-${name}-options`;
   return `<div class="field"><label for="event-${name}">${labelText}</label><input id="event-${name}" name="${name}" list="${listId}" value="${escapeHtml(inputValue ?? "")}"><datalist id="${listId}">${options.map((option) => `<option value="${escapeHtml(option)}"></option>`).join("")}</datalist></div>`;
+}
+
+function assetTypeInput(inputValue) {
+  const options = equipmentTypeOptions();
+  return `<div class="field"><label for="asset-assetType">Asset Type</label><input id="asset-assetType" name="assetType" list="asset-type-options" value="${escapeHtml(inputValue ?? "")}"><datalist id="asset-type-options">${options.map((option) => `<option value="${escapeHtml(option)}"></option>`).join("")}</datalist></div>`;
 }
 
 function select(labelText, name, options, selected, emptyLabel = "") {
@@ -611,13 +820,13 @@ function textarea(labelText, name, textValue) {
 
 function emptyAsset() {
   const next = nextId("A", state.assets);
-  return { id: next, name: "", assetType: "", isStation: false, quantity: 1, serialNumber: "", location: "", owner: "", status: "Available", shareable: false, maxConcurrentUses: 1, calibrationRequired: false, calibrationDueDate: "", notes: "" };
+  return { id: next, name: "", assetType: "", isStation: false, quantity: 1, serialNumber: "", location: "", owner: "", status: "Available", maxConcurrentUses: 1, calibrationRequired: false, calibrationDueDate: "", notes: "" };
 }
 
 function emptyEvent() {
   const next = nextId("T", state.testEvents);
   const today = dateISO(new Date());
-  return { id: next, name: "", program: "", uut: "", testType: "", startDate: today, endDate: today, stationAssetId: "", requiredAssetIds: [], priority: "Medium", owner: "", status: "Draft", notes: "" };
+  return { id: next, name: "", program: "", uut: "", testType: "", startDate: today, endDate: today, stationAssetId: "", requiredAssetIds: [], equipmentRoles: [], priority: "Medium", owner: "", status: "Draft", notes: "" };
 }
 
 function nextId(prefix, collection) {
@@ -651,12 +860,13 @@ function renderEventTable() {
     uut: item.uut,
     dates: `${item.startDate} to ${item.endDate}`,
     station: assetsById.get(item.stationAssetId)?.name || "",
+    equipment: roleSummary(item),
     priority: item.priority,
     status: item.status,
     conflicts: conflictEvents.has(item.id) ? badge("Conflict", "high") : badge("Clear", "ok"),
     actions: rowActions("event", item.id)
   }));
-  renderTable("eventTable", ["id", "name", "program", "uut", "dates", "station", "priority", "status", "conflicts", "actions"], rows);
+  renderTable("eventTable", ["id", "name", "program", "uut", "dates", "station", "equipment", "priority", "status", "conflicts", "actions"], rows);
 }
 
 function rowActions(kind, id) {
@@ -764,7 +974,7 @@ function renderConflictTable() {
   const rows = state.conflicts.map((item) => ({
     id: item.id,
     type: item.conflictType,
-    item: item.assetId ? assetsById.get(item.assetId)?.name || item.assetId : item.uut,
+    item: item.assetId ? assetsById.get(item.assetId)?.name || item.assetId : item.uut || "Equipment role",
     dates: `${item.startDate} to ${item.endDate}`,
     events: item.eventIds.map((id) => eventsById.get(id)?.name || id).join(", "),
     programs: item.programs.join(", "),
@@ -797,6 +1007,11 @@ function renderBottlenecks() {
 function renderReport() {
   const conflicts = state.conflicts;
   const bottlenecks = computeBottlenecks().slice(0, 5);
+  const roleRows = state.testEvents.map((item) => ({
+    event: item.name,
+    program: item.program,
+    equipmentRoles: roleSummary(item)
+  }));
   document.getElementById("report").innerHTML = `
     <h3>Planning Summary</h3>
     <div class="report-grid">
@@ -806,6 +1021,8 @@ function renderReport() {
     </div>
     <h3>Highest Demand Assets</h3>
     ${tableMarkup(["asset", "assetType", "conflicts", "events", "peakDemand", "capacity", "action"], bottlenecks)}
+    <h3>Equipment Role Coverage</h3>
+    ${tableMarkup(["event", "program", "equipmentRoles"], roleRows)}
     <h3>Open Conflicts</h3>
     ${tableMarkup(["id", "conflictType", "severity", "explanation", "suggestedResolution"], conflicts.slice(0, 12))}
   `;
@@ -824,13 +1041,12 @@ function handleAssetSubmit(eventObj) {
   const next = {
     ...current,
     name: formText(form, "name"),
-    assetType: formText(form, "assetType"),
+    assetType: rememberEquipmentType(formText(form, "assetType")),
     quantity: Number(formValue(form, "quantity")) || 1,
     serialNumber: formText(form, "serialNumber"),
     location: formText(form, "location"),
     owner: formText(form, "owner"),
     status: formValue(form, "status") || "Available",
-    shareable: form.has("shareable"),
     maxConcurrentUses: Number(formValue(form, "maxConcurrentUses")) || 1,
     calibrationRequired: form.has("calibrationRequired"),
     calibrationDueDate: formValue(form, "calibrationDueDate"),
@@ -869,7 +1085,13 @@ function handleEventSubmit(eventObj) {
   const current = state.testEvents.find((item) => item.id === formValue(form, "id")) || emptyEvent();
   const validAssetIds = new Set(state.assets.map((item) => item.id));
   const stationIds = new Set(state.assets.filter((item) => item.isStation).map((item) => item.id));
-  const requiredAssetIds = [...document.querySelectorAll('input[name="requiredAssetIds"]:checked')].map((inputEl) => inputEl.value).filter((assetId) => validAssetIds.has(assetId));
+  const equipmentRoles = readEquipmentRolesFromForm().map((role) => ({
+    ...role,
+    assetType: rememberEquipmentType(role.assetType),
+    label: rememberEquipmentType(role.assetType) || role.label,
+    assignedAssetIds: [...new Set((role.assignedAssetIds || []).filter((assetId) => validAssetIds.has(assetId)))].slice(0, Math.max(1, Number(role.quantity) || 1))
+  })).filter((role) => role.label || role.assetType || role.assignedAssetIds.length);
+  const assignedAssetIds = equipmentRoles.flatMap((role) => role.assignedAssetIds);
   const stationAssetId = stationIds.has(formValue(form, "stationAssetId")) ? formValue(form, "stationAssetId") : "";
   const startDate = formValue(form, "startDate");
   const endDate = formValue(form, "endDate");
@@ -884,7 +1106,8 @@ function handleEventSubmit(eventObj) {
     startDate: startDate <= endDate ? startDate : endDate,
     endDate: endDate >= startDate ? endDate : startDate,
     stationAssetId,
-    requiredAssetIds: [...new Set([stationAssetId, ...requiredAssetIds].filter(Boolean))],
+    equipmentRoles,
+    requiredAssetIds: [...new Set([stationAssetId, ...assignedAssetIds].filter(Boolean))],
     priority: formValue(form, "priority") || "Medium",
     owner: formText(form, "owner"),
     status: formValue(form, "status") || "Draft",
@@ -907,9 +1130,13 @@ function exportJson() {
 
 function exportCsv(kind) {
   const assetsById = byId(state.assets);
+  const roleText = (testEvent) => (testEvent.equipmentRoles || []).map((role) => {
+    const assigned = (role.assignedAssetIds || []).map((id) => assetsById.get(id)?.name || id).join(" + ") || "unassigned";
+    return `${role.label || role.assetType || "Equipment"} (${role.assetType || "any"} x${role.quantity || 1}): ${assigned}`;
+  }).join("; ");
   const datasets = {
     assets: state.assets,
-    events: state.testEvents.map((item) => ({ ...item, requiredAssets: fullAssetIds(item).map((id) => assetsById.get(id)?.name || id).join("; ") })),
+    events: state.testEvents.map((item) => ({ ...item, equipmentRoles: roleText(item), requiredAssets: fullAssetIds(item).map((id) => assetsById.get(id)?.name || id).join("; ") })),
     conflicts: state.conflicts,
     bottlenecks: computeBottlenecks(),
     schedule: getFilteredEvents()
@@ -998,6 +1225,12 @@ document.addEventListener("click", (eventObj) => {
   if (target.id === "cancelEventBtn") {
     closeEventModal();
   }
+  if (target.id === "addEquipmentRoleBtn") {
+    addEquipmentRole();
+  }
+  if (target.dataset.removeEquipmentRole) {
+    removeEquipmentRole(Number(target.dataset.removeEquipmentRole));
+  }
   if (target.dataset.editAsset) {
     selectedAssetId = target.dataset.editAsset;
     setActiveView("assets");
@@ -1017,7 +1250,11 @@ document.addEventListener("click", (eventObj) => {
     state.testEvents = state.testEvents.map((testEvent) => ({
       ...testEvent,
       stationAssetId: testEvent.stationAssetId === deletedAssetId ? "" : testEvent.stationAssetId,
-      requiredAssetIds: (testEvent.requiredAssetIds || []).filter((assetId) => assetId !== deletedAssetId)
+      requiredAssetIds: (testEvent.requiredAssetIds || []).filter((assetId) => assetId !== deletedAssetId),
+      equipmentRoles: (testEvent.equipmentRoles || []).map((role) => ({
+        ...role,
+        assignedAssetIds: (role.assignedAssetIds || []).filter((assetId) => assetId !== deletedAssetId)
+      }))
     }));
     selectedAssetId = "";
     refresh();
@@ -1060,8 +1297,27 @@ document.addEventListener("keydown", (eventObj) => {
 
 ["event-startDate", "event-endDate", "event-stationAssetId"].forEach((id) => {
   document.addEventListener("change", (eventObj) => {
-    if (eventObj.target.id === id) refreshEventAssetPicker();
+    if (eventObj.target.id === id) refreshEventEquipmentRoles();
   });
+});
+
+document.addEventListener("change", (eventObj) => {
+  if (!eventObj.target.closest("#eventEquipmentRoles")) return;
+  if (eventObj.target.name === "equipmentRoleType[]" && eventObj.target.value === "__new_equipment_type__") {
+    const newType = prompt("New equipment type");
+    const normalized = rememberEquipmentType(newType);
+    if (normalized) {
+      const option = document.createElement("option");
+      option.value = normalized;
+      option.textContent = normalized;
+      option.selected = true;
+      eventObj.target.insertBefore(option, eventObj.target.querySelector('option[value="__new_equipment_type__"]'));
+      saveState();
+    } else {
+      eventObj.target.value = eventObj.target.dataset.currentType || "";
+    }
+  }
+  refreshEventEquipmentRoles();
 });
 
 document.getElementById("importJson").addEventListener("change", (eventObj) => {

@@ -364,6 +364,114 @@ textarea {
   padding: 14px;
 }
 
+.role-list {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: grid;
+  overflow: hidden;
+}
+
+.role-list-header,
+.equipment-role {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(170px, 0.9fr) 76px minmax(260px, 1.4fr) auto 40px;
+}
+
+.role-list-header {
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+  color: #39423f;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 7px 8px;
+  text-transform: uppercase;
+}
+
+.equipment-role {
+  align-items: center;
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+  padding: 8px;
+}
+
+.equipment-role:last-child {
+  border-bottom: 0;
+}
+
+.equipment-role:hover {
+  background: #fbfcfb;
+}
+
+.compact-role-field input,
+.compact-role-field select,
+.role-assignment select {
+  min-height: 34px;
+  padding: 6px 8px;
+}
+
+.role-type-cell {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.role-assignment small,
+.role-status-cell small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.role-type-cell input,
+.role-type-cell select {
+  font-weight: 700;
+}
+
+.role-assignment-cell {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.role-status-cell {
+  display: grid;
+  gap: 3px;
+  justify-items: start;
+  min-width: 72px;
+}
+
+.role-assignment {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.role-assignment small {
+  overflow-wrap: anywhere;
+}
+
+.sr-only {
+  clip: rect(0 0 0 0);
+  border: 0;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}
+
+.assignment-warning,
+.assignment-shared {
+  color: var(--warn) !important;
+}
+
+.assignment-allocated,
+.assignment-blocked {
+  color: var(--danger) !important;
+}
+
 .table-panel {
   min-width: 0;
   padding: 14px;
@@ -674,6 +782,14 @@ tr:hover td {
     grid-column: 2;
     padding-left: 0;
     padding-top: 8px;
+  }
+
+  .equipment-role {
+    grid-template-columns: 1fr;
+  }
+
+  .role-list-header {
+    display: none;
   }
 
   button,
