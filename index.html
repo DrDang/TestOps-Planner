@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TestOps Planner</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Local-first planning workspace</p>
+        <h1>TestOps Planner</h1>
+      </div>
+      <div class="header-actions">
+        <button id="newPlanBtn" class="secondary">New Plan</button>
+        <button id="sampleBtn" class="secondary">Load Sample</button>
+        <label class="file-button secondary">
+          Import JSON
+          <input id="importJson" type="file" accept="application/json">
+        </label>
+        <button id="exportJsonBtn">Export JSON</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="dashboard" id="dashboard"></section>
+
+      <nav class="tabs" aria-label="Planner views">
+        <button class="tab active" data-view="schedule">Schedule</button>
+        <button class="tab" data-view="assets">Assets</button>
+        <button class="tab" data-view="events">Events</button>
+        <button class="tab" data-view="conflicts">Conflicts</button>
+        <button class="tab" data-view="bottlenecks">Bottlenecks</button>
+        <button class="tab" data-view="reports">Reports</button>
+      </nav>
+
+      <section class="toolbar" aria-label="Filters and schedule grouping">
+        <div class="field compact">
+          <label for="groupBy">Gantt View</label>
+          <select id="groupBy">
+            <option value="events">Event Schedule</option>
+            <option value="stations">Station Schedule</option>
+            <option value="programs">Program Schedule</option>
+            <option value="uuts">UUT Schedule</option>
+            <option value="assets">Asset Schedule</option>
+          </select>
+        </div>
+        <div class="field compact">
+          <label for="programFilter">Program</label>
+          <select id="programFilter"></select>
+        </div>
+        <div class="field compact">
+          <label for="uutFilter">UUT</label>
+          <select id="uutFilter"></select>
+        </div>
+        <div class="field compact">
+          <label for="stationFilter">Station</label>
+          <select id="stationFilter"></select>
+        </div>
+        <div class="field compact">
+          <label for="ownerFilter">Owner</label>
+          <select id="ownerFilter"></select>
+        </div>
+        <div class="field compact">
+          <label for="fromFilter">From</label>
+          <input id="fromFilter" type="date">
+        </div>
+        <div class="field compact">
+          <label for="toFilter">To</label>
+          <input id="toFilter" type="date">
+        </div>
+        <button id="clearFiltersBtn" class="secondary">Clear</button>
+      </section>
+
+      <section id="view-schedule" class="view active">
+        <div class="section-heading">
+          <div>
+            <h2 id="ganttTitle">Event Schedule</h2>
+            <p id="ganttSubtitle">Events are color-coded by program. Conflicts appear as badges on bars.</p>
+          </div>
+          <button id="exportScheduleCsvBtn" class="secondary">Export CSV</button>
+        </div>
+        <div id="gantt" class="gantt-wrap"></div>
+      </section>
+
+      <section id="view-assets" class="view">
+        <div class="section-heading">
+          <div>
+            <h2>Test Asset Inventory</h2>
+            <p>Stations, equipment, fixtures, chambers, licenses, tooling, and shared resources.</p>
+          </div>
+          <button id="addAssetBtn">Add Asset</button>
+        </div>
+        <div class="panel table-panel">
+          <div class="table-actions">
+            <h3>Inventory</h3>
+            <button id="exportAssetsCsvBtn" class="secondary">Export CSV</button>
+          </div>
+          <div id="assetTable" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <section id="view-events" class="view">
+        <div class="section-heading">
+          <div>
+            <h2>Test Events</h2>
+            <p>Define planned test activities once, then reuse them across every schedule view.</p>
+          </div>
+          <button id="addEventBtn">Add Event</button>
+        </div>
+        <div class="panel table-panel">
+          <div class="table-actions">
+            <h3>Events</h3>
+            <button id="exportEventsCsvBtn" class="secondary">Export CSV</button>
+          </div>
+          <div id="eventTable" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <section id="view-conflicts" class="view">
+        <div class="section-heading">
+          <div>
+            <h2>Conflict Report</h2>
+            <p>Overlapping station, equipment, UUT, availability, and calibration issues.</p>
+          </div>
+          <button id="exportConflictsCsvBtn" class="secondary">Export CSV</button>
+        </div>
+        <div id="conflictTable" class="panel table-wrap"></div>
+      </section>
+
+      <section id="view-bottlenecks" class="view">
+        <div class="section-heading">
+          <div>
+            <h2>Bottleneck Analysis</h2>
+            <p>Demand, capacity, conflicts, and suggested actions by asset.</p>
+          </div>
+          <button id="exportBottlenecksCsvBtn" class="secondary">Export CSV</button>
+        </div>
+        <div id="bottleneckTable" class="panel table-wrap"></div>
+      </section>
+
+      <section id="view-reports" class="view">
+        <div class="section-heading">
+          <div>
+            <h2>Print-Friendly Report</h2>
+            <p>Summary for reviews, deconfliction meetings, and acquisition justification.</p>
+          </div>
+          <button id="printBtn" class="secondary">Print</button>
+        </div>
+        <div id="report" class="report"></div>
+      </section>
+    </main>
+
+    <div id="assetModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-modal="asset"></div>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="assetModalTitle">
+        <div class="modal-header">
+          <h2 id="assetModalTitle">Asset</h2>
+          <button class="secondary icon-button" type="button" data-close-modal="asset" aria-label="Close asset form">X</button>
+        </div>
+        <form id="assetForm" class="form-grid"></form>
+      </section>
+    </div>
+
+    <div id="eventModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-modal="event"></div>
+      <section class="modal-panel wide" role="dialog" aria-modal="true" aria-labelledby="eventModalTitle">
+        <div class="modal-header">
+          <h2 id="eventModalTitle">Event</h2>
+          <button class="secondary icon-button" type="button" data-close-modal="event" aria-label="Close event form">X</button>
+        </div>
+        <form id="eventForm" class="form-grid"></form>
+      </section>
+    </div>
+
+    <template id="emptyState">
+      <div class="empty">
+        <h3>No rows to show</h3>
+        <p>Add data or adjust filters to populate this view.</p>
+      </div>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>
