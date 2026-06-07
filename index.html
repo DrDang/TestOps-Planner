@@ -79,9 +79,15 @@
             <h2 id="ganttTitle">Event Schedule</h2>
             <p id="ganttSubtitle">Events are color-coded by program. Conflicts appear as badges on bars.</p>
           </div>
-          <button id="exportScheduleCsvBtn" class="secondary">Export CSV</button>
+          <div class="heading-actions">
+            <button id="addScheduleEventBtn">Add Event</button>
+            <button id="exportScheduleCsvBtn" class="secondary">Export CSV</button>
+          </div>
         </div>
-        <div id="gantt" class="gantt-wrap"></div>
+        <div class="schedule-workspace">
+          <div id="gantt" class="gantt-wrap"></div>
+          <aside id="eventInspector" class="panel event-inspector" hidden></aside>
+        </div>
       </section>
 
       <section id="view-assets" class="view">
@@ -95,7 +101,14 @@
         <div class="panel table-panel">
           <div class="table-actions">
             <h3>Inventory</h3>
-            <button id="exportAssetsCsvBtn" class="secondary">Export CSV</button>
+            <div class="heading-actions">
+              <div class="field compact">
+                <label for="assetTypeFilter">Type</label>
+                <select id="assetTypeFilter"></select>
+              </div>
+              <button id="clearAssetTypeFilterBtn" class="secondary filter-clear" hidden>Clear Type Filter</button>
+              <button id="exportAssetsCsvBtn" class="secondary">Export CSV</button>
+            </div>
           </div>
           <div id="assetTable" class="table-wrap"></div>
         </div>
@@ -133,7 +146,7 @@
         <div class="section-heading">
           <div>
             <h2>Bottleneck Analysis</h2>
-            <p>Demand, capacity, conflicts, and suggested actions by asset.</p>
+            <p>Demand, quantity, conflicts, and suggested actions by asset.</p>
           </div>
           <button id="exportBottlenecksCsvBtn" class="secondary">Export CSV</button>
         </div>
@@ -171,6 +184,17 @@
           <button class="secondary icon-button" type="button" data-close-modal="event" aria-label="Close event form">X</button>
         </div>
         <form id="eventForm" class="form-grid"></form>
+      </section>
+    </div>
+
+    <div id="imageViewer" class="modal image-viewer" hidden>
+      <div class="modal-backdrop" data-close-image-viewer></div>
+      <section class="modal-panel image-viewer-panel" role="dialog" aria-modal="true" aria-label="Asset picture preview">
+        <div class="modal-header">
+          <h2 id="imageViewerTitle">Asset Picture</h2>
+          <button class="secondary icon-button" type="button" data-close-image-viewer aria-label="Close picture preview">X</button>
+        </div>
+        <div id="imageViewerBody" class="image-viewer-body"></div>
       </section>
     </div>
 
