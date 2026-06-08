@@ -990,7 +990,30 @@ tr:hover td {
 }
 
 .bar.conflict {
-  box-shadow: 0 0 0 3px rgba(184, 50, 50, 0.25);
+  border: 2px solid #d92d20;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.95), 0 0 0 7px rgba(217, 45, 32, 0.45), 0 8px 18px rgba(92, 17, 17, 0.24);
+  min-height: 62px;
+  padding-top: 24px;
+}
+
+.bar.conflict::before {
+  background: repeating-linear-gradient(
+    135deg,
+    #fff 0,
+    #fff 5px,
+    #d92d20 5px,
+    #d92d20 10px
+  );
+  content: "";
+  inset: 0 auto 0 0;
+  position: absolute;
+  width: 8px;
+}
+
+.bar.conflict strong,
+.bar.conflict span,
+.bar.conflict em {
+  margin-left: 8px;
 }
 
 .bar.non-test {
@@ -999,19 +1022,26 @@ tr:hover td {
 
 .bar.conflict.selected,
 .bar.conflict:focus-visible {
-  box-shadow: 0 0 0 3px rgba(184, 50, 50, 0.25), 0 0 0 6px rgba(36, 107, 93, 0.22);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.95), 0 0 0 7px rgba(217, 45, 32, 0.52), 0 0 0 11px rgba(36, 107, 93, 0.28), 0 8px 18px rgba(92, 17, 17, 0.24);
 }
 
 .bar-badge {
-  background: rgba(255, 255, 255, 0.92);
+  background: #fff;
+  border: 2px solid #d92d20;
   border-radius: 999px;
-  color: var(--danger);
+  color: #b42318;
   font-size: 10px;
   font-weight: 900;
-  padding: 2px 6px;
+  letter-spacing: 0;
+  line-height: 1;
+  left: 14px;
+  max-width: calc(100% - 24px);
+  overflow: hidden;
+  padding: 3px 6px;
   position: absolute;
-  right: 5px;
+  text-overflow: ellipsis;
   top: 5px;
+  white-space: nowrap;
 }
 
 .event-inspector {

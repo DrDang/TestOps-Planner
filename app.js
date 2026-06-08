@@ -11,6 +11,7 @@ const CATEGORY_COLORS = {
   Maintenance: "#6f6460",
   Outage: "#b83232"
 };
+const DOUBLE_BOOKING_CONFLICT_TYPES = new Set(["Station", "Equipment", "UUT"]);
 
 const emptyData = {
   metadata: { name: "Untitled TestOps Plan", updatedAt: new Date().toISOString() },
@@ -63,6 +64,8 @@ let inspectedEventId = "";
 let activeView = "schedule";
 const eventDrafts = new Map();
 const NEW_EVENT_DRAFT_KEY = "__new_event__";
+const assetDrafts = new Map();
+const NEW_ASSET_DRAFT_KEY = "__new_asset__";
 
 function asset(id, name, assetType, isStation, owner, status, quantity, calibrationRequired, calibrationDueDate, imageData = "") {
   return { id, name, assetType, isStation, quantity, serialNumber: "", owner, status, calibrationRequired, calibrationDueDate, imageData, notes: "" };
@@ -144,7 +147,7 @@ function normalizeEquipmentRoles(roles, legacyEquipmentIds, assetsById) {
   if (Array.isArray(roles) && roles.length) {
     return roles.map((role, index) => {
       const quantity = Math.max(1, Number(role.quantity) || 1);
-      const incomingAssignedIds = [...new Set((role.assignedAssetIds || []).filter((assetId) => validAssetIds.has(assetId)))];
+      const incomingAssignedIds = (role.assignedAssetIds || []).filter((assetId) => validAssetIds.has(assetId));
       const firstAssigned = assetsById.get(incomingAssignedIds[0]);
       const assetType = String(role.assetType || assetTypesFor(firstAssigned)[0] || "").trim();
       const assignedAssetIds = incomingAssignedIds.filter((assetId) => {
@@ -200,6 +203,16 @@ function fullAssetIds(testEvent) {
   return [...new Set([testEvent.stationAssetId, ...(testEvent.requiredAssetIds || [])].filter(Boolean))];
 }
 
+function roleAssetIds(testEvent) {
+  return (testEvent.equipmentRoles || []).flatMap((role) => role.assignedAssetIds || []).filter(Boolean);
+}
+
+function assetDemandCount(testEvent, assetId) {
+  const stationDemand = testEvent.stationAssetId === assetId ? 1 : 0;
+  const equipmentDemand = roleAssetIds(testEvent).filter((assignedAssetId) => assignedAssetId === assetId).length;
+  return stationDemand + equipmentDemand;
+}
+
 function roleFillCount(role) {
   return (role.assignedAssetIds || []).filter(Boolean).length;
 }
@@ -211,6 +224,15 @@ function roleSummary(testEvent) {
   const assigned = roles.reduce((sum, role) => sum + roleFillCount(role), 0);
   const needed = roles.reduce((sum, role) => sum + (Number(role.quantity) || 1), 0);
   return `${roles.length} role${roles.length === 1 ? "" : "s"} / ${assigned} of ${needed} assigned`;
+}
+
+function hasUnassignedRoles(testEvent) {
+  if (testEvent.eventCategory && testEvent.eventCategory !== "Test") return false;
+  return (testEvent.equipmentRoles || []).some((role) => roleFillCount(role) < (Number(role.quantity) || 1));
+}
+
+function isDoubleBookingConflict(conflict) {
+  return DOUBLE_BOOKING_CONFLICT_TYPES.has(conflict.conflictType) && (conflict.eventIds || []).length > 1;
 }
 
 function equipmentTypeOptions(extraTypes = []) {
@@ -297,6 +319,7 @@ function assetAllocation(assetId, startDate, endDate, currentEventId = "") {
     return fullAssetIds(testEvent).includes(assetId) && overlaps(testEvent, range);
   });
   const capacity = Number(assetItem.quantity || 1);
+  const overlappingDemand = overlappingEvents.reduce((sum, testEvent) => sum + assetDemandCount(testEvent, assetId), 0);
 
   if (BAD_STATUSES.has(assetItem.status)) {
     return { level: "blocked", label: assetItem.status, detail: `Asset status is ${assetItem.status}.` };
@@ -304,18 +327,18 @@ function assetAllocation(assetId, startDate, endDate, currentEventId = "") {
   if (assetItem.calibrationRequired && assetItem.calibrationDueDate && assetItem.calibrationDueDate < endDate) {
     return { level: "warning", label: "Calibration due", detail: `Calibration due ${assetItem.calibrationDueDate}.` };
   }
-  if (overlappingEvents.length >= capacity) {
+  if (overlappingDemand >= capacity) {
     return {
       level: "allocated",
       label: "Already allocated",
       detail: overlappingEvents.map((testEvent) => `${testEvent.name} (${testEvent.startDate} to ${testEvent.endDate})`).join("; ")
     };
   }
-  if (overlappingEvents.length) {
+  if (overlappingDemand) {
     return {
       level: "shared",
-      label: `${capacity - overlappingEvents.length} slot open`,
-      detail: `${overlappingEvents.length} overlapping use${overlappingEvents.length === 1 ? "" : "s"} of ${capacity}.`
+      label: `${capacity - overlappingDemand} slot open`,
+      detail: `${overlappingDemand} overlapping use${overlappingDemand === 1 ? "" : "s"} of ${capacity}.`
     };
   }
   return { level: "open", label: "Available", detail: "No overlapping use for this event window." };
@@ -382,8 +405,36 @@ function openAssetModal() {
   document.getElementById("asset-name")?.focus();
 }
 
-function closeAssetModal() {
+function closeAssetModal(saveDraft = true) {
+  if (saveDraft) saveAssetDraftFromForm();
   document.getElementById("assetModal").hidden = true;
+}
+
+function assetDraftKey(id = selectedAssetId) {
+  return id || NEW_ASSET_DRAFT_KEY;
+}
+
+function saveAssetDraftFromForm() {
+  const formEl = document.getElementById("assetForm");
+  const modalEl = document.getElementById("assetModal");
+  if (!formEl || modalEl.hidden || !formEl.innerHTML.trim()) return;
+  const form = new FormData(formEl);
+  const assetTypes = readAssetTypesFromForm(formEl, true);
+  assetDrafts.set(assetDraftKey(selectedAssetId), {
+    id: formValue(form, "id"),
+    name: formText(form, "name"),
+    assetTypes,
+    assetType: assetTypes[0] || "",
+    quantity: Number(formValue(form, "quantity")) || 1,
+    serialNumber: formText(form, "serialNumber"),
+    owner: formText(form, "owner"),
+    status: formValue(form, "status") || "Available",
+    calibrationRequired: form.has("calibrationRequired"),
+    calibrationDueDate: formValue(form, "calibrationDueDate"),
+    imageData: formValue(form, "imageData"),
+    notes: formText(form, "notes"),
+    isStation: form.has("isStation")
+  });
 }
 
 function openEventModal() {
@@ -462,7 +513,8 @@ function detectConflicts(events = state.testEvents) {
         const conflictedAsset = assetsById.get(assetId);
         if (!conflictedAsset) return;
         const capacity = Number(conflictedAsset.quantity || 1);
-        if (capacity > 1) return;
+        const combinedDemand = assetDemandCount(first, assetId) + assetDemandCount(second, assetId);
+        if (combinedDemand <= capacity) return;
         const conflictType = conflictedAsset.isStation ? "Station" : "Equipment";
         addConflict({
           conflictType,
@@ -472,7 +524,7 @@ function detectConflicts(events = state.testEvents) {
           eventIds: [first.id, second.id],
           programs: [...new Set([first.program, second.program].filter(Boolean))],
           severity: severityFor([first, second], window),
-          explanation: `${first.name} and ${second.name} both require ${conflictedAsset.name} from ${window.startDate} to ${window.endDate}. ${conflictedAsset.name} supports ${capacity} concurrent use${capacity === 1 ? "" : "s"}.`,
+          explanation: `${first.name} and ${second.name} require ${combinedDemand} total use${combinedDemand === 1 ? "" : "s"} of ${conflictedAsset.name} from ${window.startDate} to ${window.endDate}. ${conflictedAsset.name} supports ${capacity} concurrent use${capacity === 1 ? "" : "s"}.`,
           suggestedResolution: conflictedAsset.isStation ? "Reschedule one event or move an event to another station." : "Reschedule, substitute the asset, or buy/rent/borrow additional capacity."
         });
       });
@@ -483,7 +535,7 @@ function detectConflicts(events = state.testEvents) {
     const capacity = Number(assetItem.quantity || 1);
     if (capacity <= 1) return;
     const usingEvents = events.filter((testEvent) => fullAssetIds(testEvent).includes(assetItem.id));
-    const peak = peakDemand(usingEvents);
+    const peak = peakDemand(usingEvents, (testEvent) => assetDemandCount(testEvent, assetItem.id));
     if (peak.count <= capacity) return;
     const activeEvents = usingEvents.filter((testEvent) => testEvent.startDate <= peak.dates && testEvent.endDate >= peak.dates);
     addConflict({
@@ -579,7 +631,7 @@ function computeBottlenecks(events = state.testEvents, conflicts = state.conflic
     const relatedConflicts = conflicts.filter((conflict) => conflict.assetId === item.id);
     const programs = new Set(usedBy.map((testEvent) => testEvent.program).filter(Boolean));
     const totalDays = usedBy.reduce((sum, testEvent) => sum + daysInclusive(testEvent.startDate, testEvent.endDate), 0);
-    const peak = peakDemand(usedBy);
+    const peak = peakDemand(usedBy, (testEvent) => assetDemandCount(testEvent, item.id));
     const capacity = Number(item.quantity || 1);
     const shortage = Math.max(0, peak.count - capacity);
     const action = shortage > 0 ? "Buy/rent/borrow or reschedule" : relatedConflicts.length ? "Review conflict timing" : usedBy.length >= capacity * 3 ? "Monitor demand" : "No action";
@@ -602,7 +654,7 @@ function computeBottlenecks(events = state.testEvents, conflicts = state.conflic
   }).sort((a, b) => b.conflicts - a.conflicts || b.peakDemand - a.peakDemand || b.totalDays - a.totalDays);
 }
 
-function peakDemand(events) {
+function peakDemand(events, demandForEvent = () => 1) {
   if (!events.length) return { count: 0, dates: "", events: [] };
   const starts = events.map((item) => item.startDate).sort();
   const ends = events.map((item) => item.endDate).sort();
@@ -612,7 +664,8 @@ function peakDemand(events) {
   for (let cursor = parseDate(min); cursor <= parseDate(max); cursor = new Date(cursor.getTime() + MS_PER_DAY)) {
     const iso = dateISO(cursor);
     const active = events.filter((item) => item.startDate <= iso && item.endDate >= iso);
-    if (active.length > best.count) best = { count: active.length, date: iso, events: active.map((item) => item.id) };
+    const count = active.reduce((sum, item) => sum + Math.max(0, Number(demandForEvent(item)) || 0), 0);
+    if (count > best.count) best = { count, date: iso, events: active.map((item) => item.id) };
   }
   return { count: best.count, dates: best.date, events: best.events };
 }
@@ -669,7 +722,7 @@ function renderAssetFilterState() {
 }
 
 function renderDashboard() {
-  const conflicts = state.conflicts;
+  const conflicts = state.conflicts.filter(isDoubleBookingConflict);
   const bottlenecks = computeBottlenecks(state.testEvents, conflicts);
   const topBottleneck = bottlenecks.find((item) => item.conflicts > 0 || item.shortage > 0);
   const critical = conflicts.filter((item) => item.severity === "Critical").length;
@@ -688,7 +741,7 @@ function metric(label, valueText, detail) {
 }
 
 function renderAssetForm() {
-  const item = state.assets.find((assetItem) => assetItem.id === selectedAssetId) || emptyAsset();
+  const item = assetDrafts.get(assetDraftKey()) || state.assets.find((assetItem) => assetItem.id === selectedAssetId) || emptyAsset();
   document.getElementById("assetForm").innerHTML = `
     <input type="hidden" name="id" value="${escapeHtml(item.id)}">
     <input type="hidden" id="asset-imageData" name="imageData" value="${escapeHtml(item.imageData || "")}">
@@ -834,7 +887,7 @@ function equipmentRoleAddMarkup(labelText = "Add Role") {
 function renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptions = equipmentTypeOptions()) {
   const matchingAssets = state.assets.filter((assetItem) => assetMatchesType(assetItem, role.assetType));
   const quantity = Math.max(1, Number(role.quantity) || 1);
-  const assigned = [...new Set(role.assignedAssetIds || [])].slice(0, quantity);
+  const assigned = (role.assignedAssetIds || []).slice(0, quantity);
   const openSlots = Array.from({ length: quantity }, (_, slotIndex) => assigned[slotIndex] || "");
   const statusClass = assigned.filter(Boolean).length >= quantity ? "ok" : "medium";
   const matchText = role.assetType ? `${matchingAssets.length} match${matchingAssets.length === 1 ? "" : "es"}` : "Set type";
@@ -989,7 +1042,7 @@ function readEquipmentRolesFromForm() {
     const committedType = committedTypes[index]?.value.trim() || "";
     const assetType = selectedType === "__new_equipment_type__" ? committedType : selectedType || committedType;
     const quantity = Math.max(1, Number(quantities[index]?.value) || 1);
-    const assignedAssetIds = [...new Set(assignmentsByRole.get(index) || [])].filter((assetId) => {
+    const assignedAssetIds = (assignmentsByRole.get(index) || []).filter((assetId) => {
       const assetItem = state.assets.find((item) => item.id === assetId);
       return assetItem && assetMatchesType(assetItem, assetType);
     });
@@ -1117,7 +1170,7 @@ function renderAssetTable() {
 
 function renderEventTable() {
   const assetsById = byId(state.assets);
-  const conflictEvents = new Set(state.conflicts.flatMap((item) => item.eventIds));
+  const doubleBookedEvents = new Set(state.conflicts.filter(isDoubleBookingConflict).flatMap((item) => item.eventIds));
   const rows = getFilteredEvents().map((item) => ({
     id: item.id,
     category: item.eventCategory || "Test",
@@ -1129,15 +1182,17 @@ function renderEventTable() {
     equipment: roleSummary(item),
     priority: item.priority,
     status: item.status,
-    conflicts: conflictEvents.has(item.id) ? badge("Conflict", "high") : badge("Clear", "ok"),
+    roleStatus: hasUnassignedRoles(item) ? badge("Unassigned", "medium") : badge("Assigned", "ok"),
+    conflicts: doubleBookedEvents.has(item.id) ? badge("Double-booked", "high") : badge("Clear", "ok"),
     actions: rowActions("event", item.id)
   }));
-  renderTable("eventTable", ["id", "category", "name", "program", "uut", "dates", "station", "equipment", "priority", "status", "conflicts", "actions"], rows);
+  renderTable("eventTable", ["id", "category", "name", "program", "uut", "dates", "station", "equipment", "priority", "status", "roleStatus", "conflicts", "actions"], rows);
 }
 
 function rowActions(kind, id) {
   const duplicate = kind === "asset" ? `<button class="secondary" data-duplicate-asset="${escapeHtml(id)}">Duplicate</button>` : "";
-  return `<div class="row-actions"><button class="secondary" data-edit-${kind}="${escapeHtml(id)}">Edit</button>${duplicate}<button class="secondary" data-delete-${kind}="${escapeHtml(id)}">Delete</button></div>`;
+  const report = kind === "event" ? `<button class="secondary" data-event-report="${escapeHtml(id)}">Report</button>` : "";
+  return `<div class="row-actions"><button class="secondary" data-edit-${kind}="${escapeHtml(id)}">Edit</button>${report}${duplicate}<button class="secondary" data-delete-${kind}="${escapeHtml(id)}">Delete</button></div>`;
 }
 
 function statusBadge(status) {
@@ -1160,11 +1215,12 @@ function renderTable(targetId, columns, rows) {
 }
 
 function renderGantt() {
-  const groupBy = value("groupBy");
-  const events = getFilteredEvents().sort((a, b) => a.startDate.localeCompare(b.startDate));
+  const ganttView = value("groupBy");
+  const groupBy = ganttView === "calibration" ? "events" : ganttView;
+  const events = getGanttEvents(ganttView).sort((a, b) => a.startDate.localeCompare(b.startDate));
   const assetsById = byId(state.assets);
-  const conflictEvents = new Set(state.conflicts.flatMap((item) => item.eventIds));
-  document.getElementById("ganttTitle").textContent = labelize(groupBy === "events" ? "event schedule" : `${groupBy} schedule`);
+  const conflictEvents = new Set(state.conflicts.filter(isDoubleBookingConflict).flatMap((item) => item.eventIds));
+  document.getElementById("ganttTitle").textContent = ganttView === "calibration" ? "Calibration Events" : labelize(groupBy === "events" ? "event schedule" : `${groupBy} schedule`);
   if (!events.length) {
     document.getElementById("gantt").innerHTML = document.getElementById("emptyState").innerHTML;
     return;
@@ -1185,6 +1241,12 @@ function renderGantt() {
     </div>
   `;
   document.getElementById("gantt").innerHTML = html;
+}
+
+function getGanttEvents(ganttView = value("groupBy")) {
+  const events = getFilteredEvents();
+  if (ganttView === "calibration") return events.filter((item) => item.eventCategory === "Calibration");
+  return events;
 }
 
 function renderScheduleLegend(events) {
@@ -1221,7 +1283,7 @@ function buildGroups(groupBy, events, assetsById) {
 }
 
 function renderLane(group, start, totalDays, assetsById, conflictEvents) {
-  const barSlotHeight = 64;
+  const barSlotHeight = 78;
   const bars = group.events.map((item, index) => {
     const left = Math.max(0, ((parseDate(item.startDate) - parseDate(start)) / MS_PER_DAY) / totalDays * 100);
     const width = Math.max(2, daysInclusive(item.startDate, item.endDate) / totalDays * 100);
@@ -1230,7 +1292,7 @@ function renderLane(group, start, totalDays, assetsById, conflictEvents) {
     const hasConflict = conflictEvents.has(item.id);
     const top = 10 + index * barSlotHeight;
     const dateRange = `${item.startDate} to ${item.endDate}`;
-    return `<button type="button" class="bar ${item.eventCategory !== "Test" ? "non-test" : ""} ${hasConflict ? "conflict" : ""} ${inspectedEventId === item.id ? "selected" : ""}" data-inspect-event="${escapeHtml(item.id)}" title="${escapeHtml(`${item.name} / ${dateRange}`)}" style="left:${left}%;width:${width}%;top:${top}px;background:${color}"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(eventSubtitle(item, assetsById))}</span><em>${escapeHtml(dateRange)}</em>${hasConflict ? '<span class="bar-badge">!</span>' : ""}</button>`;
+    return `<button type="button" class="bar ${item.eventCategory !== "Test" ? "non-test" : ""} ${hasConflict ? "conflict" : ""} ${inspectedEventId === item.id ? "selected" : ""}" data-inspect-event="${escapeHtml(item.id)}" title="${escapeHtml(`${item.name} / ${dateRange}`)}" style="left:${left}%;width:${width}%;top:${top}px;background:${color}"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(eventSubtitle(item, assetsById))}</span><em>${escapeHtml(dateRange)}</em>${hasConflict ? '<span class="bar-badge">Conflict</span>' : ""}</button>`;
   }).join("");
   const height = Math.max(86, 28 + group.events.length * barSlotHeight);
   return `<div class="lane" style="min-height:${height}px"><div class="lane-label">${escapeHtml(group.label)}<small>${escapeHtml(group.sublabel || `${group.events.length} event${group.events.length === 1 ? "" : "s"}`)}</small></div><div class="bar-zone" style="min-height:${height}px">${bars}</div></div>`;
@@ -1256,6 +1318,8 @@ function renderEventInspector() {
   const assetsById = byId(state.assets);
   const station = assetsById.get(item.stationAssetId);
   const conflicts = state.conflicts.filter((conflict) => (conflict.eventIds || []).includes(item.id));
+  const doubleBookingConflicts = conflicts.filter(isDoubleBookingConflict);
+  const planningIssues = conflicts.filter((conflict) => !isDoubleBookingConflict(conflict));
   target.hidden = false;
   target.innerHTML = `
     <div class="inspector-header">
@@ -1267,6 +1331,7 @@ function renderEventInspector() {
     </div>
     <div class="inspector-actions">
       <button type="button" data-edit-event="${escapeHtml(item.id)}">Edit Event</button>
+      <button type="button" class="secondary" data-event-report="${escapeHtml(item.id)}">Event Report</button>
     </div>
     <dl class="detail-list">
       ${detailItem("Category", item.eventCategory || "Test")}
@@ -1285,8 +1350,12 @@ function renderEventInspector() {
       ${renderInspectorEquipmentRoles(item, assetsById)}
     </div>` : ""}
     <div class="inspector-section">
-      <h4>Conflicts</h4>
-      ${conflicts.length ? conflicts.map((conflict) => `<p class="inspector-conflict">${badge(conflict.severity, conflict.severity === "Critical" ? "high" : "medium")} ${escapeHtml(conflict.conflictType)}: ${escapeHtml(conflict.explanation)}</p>`).join("") : `<p class="muted-line">No conflicts for this event.</p>`}
+      <h4>Resource Conflicts</h4>
+      ${doubleBookingConflicts.length ? doubleBookingConflicts.map((conflict) => `<p class="inspector-conflict">${badge(conflict.severity, conflict.severity === "Critical" ? "high" : "medium")} ${escapeHtml(conflict.conflictType)}: ${escapeHtml(conflict.explanation)}</p>`).join("") : `<p class="muted-line">No double-booked resources for this event.</p>`}
+    </div>
+    <div class="inspector-section">
+      <h4>Planning Issues</h4>
+      ${planningIssues.length ? planningIssues.map((conflict) => `<p class="inspector-conflict">${badge(conflict.severity, conflict.severity === "Critical" ? "high" : "medium")} ${escapeHtml(conflict.conflictType)}: ${escapeHtml(conflict.explanation)}</p>`).join("") : `<p class="muted-line">No assignment or readiness issues for this event.</p>`}
     </div>
     ${item.notes ? `<div class="inspector-section"><h4>Notes</h4><p>${escapeHtml(item.notes)}</p></div>` : ""}
   `;
@@ -1339,7 +1408,7 @@ function eventColor(item) {
 function renderConflictTable() {
   const assetsById = byId(state.assets);
   const eventsById = byId(state.testEvents);
-  const rows = state.conflicts.map((item) => ({
+  const rows = state.conflicts.filter(isDoubleBookingConflict).map((item) => ({
     id: item.id,
     type: item.conflictType,
     item: item.assetId ? assetsById.get(item.assetId)?.name || item.assetId : item.uut || "Equipment role",
@@ -1373,7 +1442,7 @@ function renderBottlenecks() {
 }
 
 function renderReport() {
-  const conflicts = state.conflicts;
+  const conflicts = state.conflicts.filter(isDoubleBookingConflict);
   const bottlenecks = computeBottlenecks().slice(0, 5);
   const roleRows = state.testEvents.map((item) => ({
     event: item.name,
@@ -1435,10 +1504,12 @@ function handleAssetSubmit(eventObj) {
   const index = state.assets.findIndex((item) => item.id === next.id);
   if (index >= 0) state.assets[index] = next;
   else state.assets.push(next);
+  assetDrafts.delete(assetDraftKey(selectedAssetId));
+  assetDrafts.delete(assetDraftKey(next.id));
   selectedAssetId = next.id;
   setActiveView("assets");
   refresh();
-  closeAssetModal();
+  closeAssetModal(false);
 }
 
 function duplicateAsset(assetId) {
@@ -1469,7 +1540,7 @@ function handleEventSubmit(eventObj) {
     ...role,
     assetType: rememberEquipmentType(role.assetType),
     label: rememberEquipmentType(role.assetType) || role.label,
-    assignedAssetIds: [...new Set((role.assignedAssetIds || []).filter((assetId) => validAssetIds.has(assetId)))].slice(0, Math.max(1, Number(role.quantity) || 1))
+    assignedAssetIds: (role.assignedAssetIds || []).filter((assetId) => validAssetIds.has(assetId)).slice(0, Math.max(1, Number(role.quantity) || 1))
   })).filter((role) => role.label || role.assetType || role.assignedAssetIds.length) : [];
   const assignedAssetIds = equipmentRoles.flatMap((role) => role.assignedAssetIds);
   const stationAssetId = stationIds.has(formValue(form, "stationAssetId")) ? formValue(form, "stationAssetId") : "";
@@ -1563,14 +1634,152 @@ function exportCsv(kind) {
   const datasets = {
     assets: state.assets.map(({ imageData, ...assetItem }) => ({ ...assetItem, assetTypes: assetTypeText(assetItem), hasPicture: imageData ? "Yes" : "No" })),
     events: state.testEvents.map((item) => ({ ...item, equipmentRoles: roleText(item), requiredAssets: fullAssetIds(item).map((id) => assetsById.get(id)?.name || id).join("; ") })),
-    conflicts: state.conflicts,
+    conflicts: state.conflicts.filter(isDoubleBookingConflict),
     bottlenecks: computeBottlenecks(),
-    schedule: getFilteredEvents()
+    schedule: getGanttEvents()
   };
   const rows = datasets[kind] || [];
   const columns = rows.length ? Object.keys(rows[0]) : [];
   const csv = [columns.join(","), ...rows.map((row) => columns.map((column) => csvCell(row[column])).join(","))].join("\n");
   download(`testops-${kind}-${dateISO(new Date())}.csv`, csv, "text/csv");
+}
+
+function exportEventReport(eventId) {
+  const testEvent = state.testEvents.find((item) => item.id === eventId);
+  if (!testEvent) return;
+  const assetsById = byId(state.assets);
+  const station = assetsById.get(testEvent.stationAssetId);
+  const conflicts = state.conflicts.filter((conflict) => (conflict.eventIds || []).includes(testEvent.id));
+  const doubleBookingConflicts = conflicts.filter(isDoubleBookingConflict);
+  const planningIssues = conflicts.filter((conflict) => !isDoubleBookingConflict(conflict));
+  const roleRows = (testEvent.equipmentRoles || []).flatMap((role) => {
+    const quantity = Math.max(1, Number(role.quantity) || 1);
+    const assignments = [...(role.assignedAssetIds || []), ...Array.from({ length: Math.max(0, quantity - (role.assignedAssetIds || []).length) }, () => "")].slice(0, quantity);
+    return assignments.map((assetId, index) => {
+      const assetItem = assetsById.get(assetId);
+      const allocation = assetId ? assetAllocation(assetId, testEvent.startDate, testEvent.endDate, testEvent.id) : null;
+      return {
+        role: role.label || role.assetType || "Equipment role",
+        type: role.assetType || "Any type",
+        slot: index + 1,
+        asset: assetItem ? assetOptionLabel(assetItem) : "Unassigned",
+        status: assetItem?.status || "",
+        calibration: assetItem?.calibrationRequired ? assetItem.calibrationDueDate || "Required" : "Not required",
+        allocation: allocation?.label || "Unassigned"
+      };
+    });
+  });
+  const body = `
+    <section class="hero">
+      <p>${escapeHtml(testEvent.id)} / ${escapeHtml(testEvent.eventCategory || "Test")}</p>
+      <h1>${escapeHtml(testEvent.name || "Untitled event")}</h1>
+      <dl>
+        ${reportDetail("Program", testEvent.program)}
+        ${eventUsesUut(testEvent.eventCategory || "Test") ? reportDetail(eventUutLabel(testEvent.eventCategory || "Test"), testEvent.uut) : ""}
+        ${reportDetail("Dates", `${testEvent.startDate} to ${testEvent.endDate}`)}
+        ${reportDetail("Station", station ? assetOptionLabel(station) : "No station assigned")}
+        ${reportDetail("Priority", testEvent.priority)}
+        ${reportDetail("Owner", testEvent.owner)}
+      </dl>
+    </section>
+    <h2>Required Equipment Roles</h2>
+    ${tableMarkup(["role", "type", "slot", "asset", "status", "calibration", "allocation"], roleRows)}
+    <h2>Allocated Assets</h2>
+    ${assetInventoryCards(unique([testEvent.stationAssetId, ...roleAssetIds(testEvent)].filter(Boolean)).map((assetId) => assetsById.get(assetId)).filter(Boolean))}
+    <h2>Resource Conflicts</h2>
+    ${reportIssueList(doubleBookingConflicts)}
+    <h2>Planning Issues</h2>
+    ${reportIssueList(planningIssues)}
+    ${testEvent.notes ? `<h2>Notes</h2><p>${escapeHtml(testEvent.notes)}</p>` : ""}
+  `;
+  download(`testops-event-report-${safeFilename(testEvent.id || testEvent.name)}-${dateISO(new Date())}.html`, standaloneReportHtml(`${testEvent.name || "Event"} Report`, body), "text/html");
+}
+
+function exportAssetsHtml() {
+  const assetTypeFilter = value("assetTypeFilter");
+  const assets = state.assets.filter((item) => assetMatchesType(item, assetTypeFilter));
+  const body = `
+    <section class="hero">
+      <p>TestOps Planner</p>
+      <h1>Asset Inventory</h1>
+      <dl>
+        ${reportDetail("Assets", assets.length)}
+        ${reportDetail("Type Filter", assetTypeFilter || "All types")}
+        ${reportDetail("Generated", new Date().toLocaleString())}
+      </dl>
+    </section>
+    ${assetInventoryCards(assets)}
+  `;
+  download(`testops-asset-inventory-${dateISO(new Date())}.html`, standaloneReportHtml("Asset Inventory", body), "text/html");
+}
+
+function assetInventoryCards(assets) {
+  if (!assets.length) return document.getElementById("emptyState").innerHTML;
+  return `<div class="asset-report-grid">${assets.map((assetItem) => `
+    <article class="asset-report-card">
+      <div class="asset-report-image">${assetImageMarkup(assetItem, `${assetItem.name} picture`)}</div>
+      <div>
+        <h2>${escapeHtml(assetItem.name || assetItem.id)}</h2>
+        <dl>
+          ${reportDetail("ID", assetItem.id)}
+          ${reportDetail("Type", assetTypeText(assetItem))}
+          ${reportDetail("Serial", assetItem.serialNumber)}
+          ${reportDetail("Status", assetItem.status)}
+          ${reportDetail("Quantity", assetItem.quantity || 1)}
+          ${reportDetail("Owner", assetItem.owner)}
+          ${reportDetail("Calibration", assetItem.calibrationRequired ? assetItem.calibrationDueDate || "Required" : "Not required")}
+          ${reportDetail("Station", assetItem.isStation ? "Yes" : "No")}
+        </dl>
+        ${assetItem.notes ? `<p>${escapeHtml(assetItem.notes)}</p>` : ""}
+      </div>
+    </article>
+  `).join("")}</div>`;
+}
+
+function reportIssueList(issues) {
+  if (!issues.length) return `<p class="muted">None.</p>`;
+  return `<ul class="issue-list">${issues.map((issue) => `<li><strong>${escapeHtml(issue.conflictType)}</strong> ${escapeHtml(issue.explanation)} <em>${escapeHtml(issue.suggestedResolution)}</em></li>`).join("")}</ul>`;
+}
+
+function reportDetail(label, valueText) {
+  const displayValue = valueText === undefined || valueText === null || valueText === "" ? "Not set" : valueText;
+  return `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(displayValue)}</dd></div>`;
+}
+
+function standaloneReportHtml(title, body) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body { color: #1f2933; font-family: Arial, sans-serif; margin: 32px; }
+    h1, h2 { margin: 0 0 12px; }
+    h2 { border-bottom: 1px solid #d8dee4; font-size: 18px; padding-bottom: 6px; }
+    .hero { border-bottom: 3px solid #246b5d; margin-bottom: 24px; padding-bottom: 16px; }
+    .hero p, .muted { color: #667085; font-weight: 700; margin: 0 0 6px; }
+    dl { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; }
+    dt { color: #667085; font-size: 11px; font-weight: 800; text-transform: uppercase; }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    table { border-collapse: collapse; margin-bottom: 22px; width: 100%; }
+    th, td { border: 1px solid #d8dee4; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #f4f7f6; }
+    .asset-report-grid { display: grid; gap: 14px; }
+    .asset-report-card { border: 1px solid #d8dee4; border-radius: 8px; display: grid; gap: 14px; grid-template-columns: 180px 1fr; padding: 12px; break-inside: avoid; }
+    .asset-report-image { align-items: center; background: #f7f9fb; border: 1px solid #d8dee4; border-radius: 6px; display: flex; justify-content: center; min-height: 130px; overflow: hidden; }
+    .asset-report-image img { height: 100%; max-height: 170px; max-width: 100%; object-fit: contain; }
+    .asset-report-image span { color: #667085; }
+    .issue-list { display: grid; gap: 8px; padding-left: 20px; }
+    .issue-list em { color: #667085; display: block; }
+    @media print { body { margin: 18px; } }
+  </style>
+</head>
+<body>${body}</body>
+</html>`;
+}
+
+function safeFilename(text) {
+  return String(text || "report").trim().replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase() || "report";
 }
 
 function csvCell(valueCell) {
@@ -1596,6 +1805,7 @@ function importJson(file) {
       selectedAssetId = "";
       selectedEventId = "";
       inspectedEventId = "";
+      assetDrafts.clear();
       eventDrafts.clear();
       refresh();
     } catch (error) {
@@ -1616,6 +1826,7 @@ function handleAssetImageSelect(file) {
     if (inputEl) inputEl.value = imageData;
     if (previewEl) previewEl.innerHTML = assetImageMarkup({ imageData }, "Asset image preview");
     if (removeBtn) removeBtn.disabled = false;
+    saveAssetDraftFromForm();
   };
   reader.readAsDataURL(file);
 }
@@ -1637,6 +1848,7 @@ function removeAssetImage() {
   if (fileEl) fileEl.value = "";
   if (previewEl) previewEl.innerHTML = assetImageMarkup({ imageData: "" }, "Asset image preview");
   if (removeBtn) removeBtn.disabled = true;
+  saveAssetDraftFromForm();
 }
 
 function addAssetTypeFromEntry() {
@@ -1652,11 +1864,13 @@ function addAssetTypeFromEntry() {
   inputEl.focus();
   renderAssetTypeRequiredWarning(false);
   renderAssetDuplicateWarning();
+  saveAssetDraftFromForm();
 }
 
 function removeAssetType(assetType) {
   [...document.querySelectorAll('input[name="assetTypes[]"]')].find((inputEl) => inputEl.value === assetType)?.closest(".asset-type-chip")?.remove();
   renderAssetDuplicateWarning();
+  saveAssetDraftFromForm();
 }
 
 function readAssetCandidateFromForm(formEl = document.getElementById("assetForm")) {
@@ -1744,6 +1958,9 @@ document.addEventListener("click", (eventObj) => {
     renderGantt();
     renderEventInspector();
   }
+  if (target.dataset.eventReport) {
+    exportEventReport(target.dataset.eventReport);
+  }
   if (target.dataset.closeEventInspector !== undefined) {
     inspectedEventId = "";
     renderGantt();
@@ -1757,6 +1974,7 @@ document.addEventListener("click", (eventObj) => {
     selectedAssetId = "";
     selectedEventId = "";
     inspectedEventId = "";
+    assetDrafts.clear();
     eventDrafts.clear();
     refresh();
   }
@@ -1765,6 +1983,7 @@ document.addEventListener("click", (eventObj) => {
     selectedAssetId = "";
     selectedEventId = "";
     inspectedEventId = "";
+    assetDrafts.clear();
     eventDrafts.clear();
     refresh();
   }
@@ -1849,6 +2068,7 @@ document.addEventListener("click", (eventObj) => {
   }
   if (target.id === "printBtn") window.print();
   if (target.id === "exportAssetsCsvBtn") exportCsv("assets");
+  if (target.id === "exportAssetsHtmlBtn") exportAssetsHtml();
   if (target.id === "exportEventsCsvBtn") exportCsv("events");
   if (target.id === "exportConflictsCsvBtn") exportCsv("conflicts");
   if (target.id === "exportBottlenecksCsvBtn") exportCsv("bottlenecks");
@@ -1907,6 +2127,13 @@ document.addEventListener("change", (eventObj) => {
 });
 
 document.addEventListener("change", (eventObj) => {
+  if (!eventObj.target.closest("#assetForm")) return;
+  renderAssetTypeRequiredWarning(false);
+  renderAssetDuplicateWarning();
+  saveAssetDraftFromForm();
+});
+
+document.addEventListener("change", (eventObj) => {
   if (eventObj.target.id !== "event-eventCategory") return;
   saveEventDraftFromForm();
   renderEventForm();
@@ -1942,6 +2169,7 @@ document.addEventListener("input", (eventObj) => {
   if (!eventObj.target.closest("#assetForm")) return;
   renderAssetTypeRequiredWarning(false);
   renderAssetDuplicateWarning();
+  saveAssetDraftFromForm();
 });
 
 document.addEventListener("dragover", (eventObj) => {
