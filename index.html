@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
@@ -42,6 +42,7 @@
             <option value="events">Event Schedule</option>
             <option value="calibration">Calibration Events</option>
             <option value="stations">Station Schedule</option>
+            <option value="operators">Operator Schedule</option>
             <option value="programs">Program Schedule</option>
             <option value="uuts">UUT Schedule</option>
             <option value="assets">Asset Schedule</option>
@@ -114,6 +115,7 @@
           </div>
           <div id="assetTable" class="table-wrap"></div>
         </div>
+        <button id="addAssetFloatingBtn" class="floating-add-asset">Add Asset</button>
       </section>
 
       <section id="view-events" class="view">
@@ -137,7 +139,7 @@
         <div class="section-heading">
           <div>
             <h2>Conflict Report</h2>
-            <p>Overlapping station, equipment, UUT, availability, and calibration issues.</p>
+            <p>Overlapping station, operator, equipment, UUT, availability, and calibration issues.</p>
           </div>
           <button id="exportConflictsCsvBtn" class="secondary">Export CSV</button>
         </div>
@@ -197,6 +199,21 @@
           <button class="secondary icon-button" type="button" data-close-image-viewer aria-label="Close picture preview">X</button>
         </div>
         <div id="imageViewerBody" class="image-viewer-body"></div>
+      </section>
+    </div>
+
+    <div id="eventReportViewer" class="modal report-viewer" hidden>
+      <div class="modal-backdrop" data-close-event-report></div>
+      <section class="modal-panel report-viewer-panel" role="dialog" aria-modal="true" aria-labelledby="eventReportViewerTitle">
+        <div class="modal-header">
+          <h2 id="eventReportViewerTitle">Event Report</h2>
+          <button class="secondary icon-button" type="button" data-close-event-report aria-label="Close event report">X</button>
+        </div>
+        <div class="report-viewer-actions">
+          <button id="printEventReportBtn" type="button" class="secondary">Print</button>
+          <button id="saveEventReportBtn" type="button">Save HTML</button>
+        </div>
+        <iframe id="eventReportFrame" class="report-frame" title="Event report preview"></iframe>
       </section>
     </div>
 
