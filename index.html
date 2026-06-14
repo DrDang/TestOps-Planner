@@ -19,6 +19,7 @@
           Import JSON
           <input id="importJson" type="file" accept="application/json">
         </label>
+        <button id="saveJsonBtn" class="secondary" title="Save JSON (Ctrl+S)">Save JSON</button>
         <button id="exportJsonBtn">Export JSON</button>
       </div>
     </header>
@@ -35,8 +36,8 @@
         <button class="tab" data-view="reports">Reports</button>
       </nav>
 
-      <section class="toolbar" aria-label="Filters and schedule grouping">
-        <div class="field compact">
+      <section id="scheduleFilters" class="toolbar" aria-label="Filters and schedule grouping">
+        <div id="scheduleViewModeField" class="field compact">
           <label for="groupBy">Gantt View</label>
           <select id="groupBy">
             <option value="events">Event Schedule</option>
@@ -101,9 +102,22 @@
           <button id="addAssetBtn">Add Asset</button>
         </div>
         <div class="panel table-panel">
-          <div class="table-actions">
-            <h3>Inventory</h3>
-            <div class="heading-actions">
+          <div class="table-actions asset-table-actions">
+            <div class="heading-actions asset-filter-actions">
+              <div class="field compact">
+                <label for="assetCategoryFilter">Category</label>
+                <select id="assetCategoryFilter">
+                  <option value="">All assets</option>
+                  <option value="testEquipment">Test Equipment</option>
+                  <option value="dut">DUT</option>
+                  <option value="rack">Racks</option>
+                  <option value="operator">Test Operators</option>
+                </select>
+              </div>
+              <div class="field compact search-field">
+                <label for="assetSearchFilter">Search</label>
+                <input id="assetSearchFilter" type="search" placeholder="Search assets">
+              </div>
               <div class="field compact">
                 <label for="assetTypeFilter">Type</label>
                 <select id="assetTypeFilter"></select>
@@ -150,7 +164,7 @@
         <div class="section-heading">
           <div>
             <h2>Bottleneck Analysis</h2>
-            <p>Demand, quantity, conflicts, and suggested actions by asset.</p>
+            <p>Demand, conflicts, and suggested actions by asset.</p>
           </div>
           <button id="exportBottlenecksCsvBtn" class="secondary">Export CSV</button>
         </div>

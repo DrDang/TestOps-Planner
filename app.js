@@ -1,10 +1,16 @@
 "use strict";
 
 const STORAGE_KEY = "testops-planner-v2";
+const PLAN_FILE_DB = "testops-planner-file-handles";
+const PLAN_FILE_STORE = "handles";
+const LAST_PLAN_FILE_KEY = "last-json";
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const PROGRAM_COLORS = ["#246b5d", "#8b4b8f", "#2f6f9f", "#b45c2d", "#5b6f28", "#7d4e2c", "#355da8", "#9a3d54"];
 const BAD_STATUSES = new Set(["Down", "Out for Calibration", "Retired", "Unknown"]);
 const EVENT_CATEGORIES = ["Test", "Demo", "Calibration", "Maintenance", "Outage"];
+const DUT_TYPE = "DUT";
+const RACK_TYPE = "Rack";
+const TEST_OPERATOR_TYPE = "Test Operator";
 const CATEGORY_COLORS = {
   Demo: "#2d6f9f",
   Calibration: "#7a5c12",
@@ -63,13 +69,19 @@ let selectedEventId = "";
 let inspectedEventId = "";
 let activeView = "schedule";
 let currentEventReport = null;
+let planFileHandle = null;
+let planFileName = "";
+let canUseStoredPlanFileHandle = true;
+let saveJsonFeedbackTimer = 0;
 const eventDrafts = new Map();
 const NEW_EVENT_DRAFT_KEY = "__new_event__";
 const assetDrafts = new Map();
 const NEW_ASSET_DRAFT_KEY = "__new_asset__";
+const assetColumnFilters = {};
+const ASSET_COLUMN_EMPTY_FILTER = "__empty__";
 
 function asset(id, name, assetType, isStation, owner, status, quantity, calibrationRequired, calibrationDueDate, imageData = "", stationGroupId = "") {
-  return { id, manufacturer: "", name, assetType, stationGroupId, isStation, isOperator: false, quantity, serialNumber: "", owner, status, calibrationRequired, calibrationDueDate, capabilities: "", imagePath: "", imageData, notes: "" };
+  return { id, manufacturer: "", name, assetType, stationGroupId, isStation, isRack: false, isOperator: false, isDut: false, quantity, serialNumber: "", owner, status, calibrationRequired, calibrationDueDate, capabilities: "", imagePath: "", imageData, notes: "" };
 }
 
 function event(id, name, program, uut, testType, startDate, endDate, stationAssetId, requiredAssetIds, priority, owner, status, equipmentRoles = [], eventCategory = "Test") {
@@ -116,30 +128,45 @@ function normalizeState(data) {
 }
 
 function reconcileState(nextState = state) {
-  nextState.assets = nextState.assets.map(({ assetTag, shareable, location, maxConcurrentUses, ...assetItem }) => ({
-    ...assetItem,
-    manufacturer: assetItem.manufacturer || "",
-    isOperator: Boolean(assetItem.isOperator),
-    assetTypes: unique(assetTypesFor(assetItem)),
-    assetType: assetTypesFor(assetItem)[0] || "",
-    stationGroupId: assetItem.stationGroupId || "",
-    quantity: Number(maxConcurrentUses || assetItem.quantity || 1),
-    capabilities: assetItem.capabilities || "",
-    imagePath: assetItem.imagePath || "",
-    imageData: assetItem.imageData || ""
-  }));
+  nextState.settings.dutTypeDependencies = normalizeDutDependencyMap(nextState.settings.dutTypeDependencies);
+  nextState.assets = nextState.assets.map(({ assetTag, shareable, location, maxConcurrentUses, ...assetItem }) => {
+    const incomingTypes = assetTypesFor(assetItem);
+    const isRack = Boolean(assetItem.isRack) || incomingTypes.includes(RACK_TYPE);
+    const isDut = Boolean(assetItem.isDut) || incomingTypes.includes(DUT_TYPE);
+    const assetTypes = unique([...incomingTypes, ...(isRack ? [RACK_TYPE] : []), ...(isDut ? [DUT_TYPE] : [])]);
+    return {
+      ...assetItem,
+      manufacturer: assetItem.manufacturer || "",
+      isStation: isRack ? false : Boolean(assetItem.isStation),
+      isRack,
+      isOperator: Boolean(assetItem.isOperator),
+      isDut,
+      dutType: assetItem.dutType || "",
+      assetTypes,
+      assetType: assetTypes[0] || "",
+      stationGroupId: assetItem.stationGroupId || "",
+      quantity: Number(maxConcurrentUses || assetItem.quantity || 1),
+      capabilities: assetItem.capabilities || "",
+      imagePath: assetItem.imagePath || "",
+      imageData: assetItem.imageData || ""
+    };
+  });
+  const assetExpansion = expandMultiQuantityAssets(nextState.assets);
+  nextState.assets = assetExpansion.assets;
+  nextState.testEvents = remapExpandedAssetReferences(nextState.testEvents, assetExpansion.pools);
   const validAssetIds = new Set(nextState.assets.map((item) => item.id));
   const stationIds = new Set(nextState.assets.filter((item) => item.isStation).map((item) => item.id));
+  const rackIds = new Set(nextState.assets.filter((item) => item.isRack).map((item) => item.id));
   nextState.assets = nextState.assets.map((assetItem) => ({
     ...assetItem,
-    stationGroupId: stationIds.has(assetItem.stationGroupId) && assetItem.stationGroupId !== assetItem.id ? assetItem.stationGroupId : ""
+    stationGroupId: !assetItem.isOperator && !assetItem.isDut && !assetItem.isRack && rackIds.has(assetItem.stationGroupId) && assetItem.stationGroupId !== assetItem.id ? assetItem.stationGroupId : ""
   }));
   const operatorIds = new Set(nextState.assets.filter((item) => item.isOperator).map((item) => item.id));
   const assetsById = byId(nextState.assets);
   nextState.testEvents = nextState.testEvents.map((testEvent) => {
     const eventCategory = EVENT_CATEGORIES.includes(testEvent.eventCategory) ? testEvent.eventCategory : "Test";
     const stationAssetId = stationIds.has(testEvent.stationAssetId) ? testEvent.stationAssetId : "";
-    const stationGroupId = stationIds.has(testEvent.stationGroupId) ? testEvent.stationGroupId : "";
+    const stationGroupId = rackIds.has(testEvent.stationGroupId) ? testEvent.stationGroupId : "";
     const operatorAssetIds = operatorIdsForEvent(testEvent).filter((assetId) => operatorIds.has(assetId));
     const legacyEquipmentIds = [...new Set((testEvent.requiredAssetIds || []).filter((assetId) => validAssetIds.has(assetId) && assetId !== stationAssetId && !operatorAssetIds.includes(assetId)))];
     const equipmentRoles = eventUsesEquipment(eventCategory) ? normalizeEquipmentRoles(testEvent.equipmentRoles, legacyEquipmentIds, assetsById) : [];
@@ -158,8 +185,154 @@ function reconcileState(nextState = state) {
     };
   });
   nextState.programs = unique([...(nextState.programs || []), ...nextState.testEvents.map((item) => item.program)]);
-  nextState.uuts = unique([...(nextState.uuts || []), ...nextState.testEvents.map((item) => item.uut)]);
+  const eventUuts = unique(nextState.testEvents.filter((item) => eventUsesUut(item.eventCategory)).map((item) => item.uut));
+  nextState.uuts = unique([...(nextState.uuts || []), ...eventUuts]);
+  syncDutAssetsFromUuts(nextState, eventUuts);
   return nextState;
+}
+
+function expandMultiQuantityAssets(assets) {
+  const expanded = [];
+  const pools = new Map();
+  assets.forEach((assetItem) => {
+    const count = Math.max(1, Math.floor(Number(assetItem.quantity) || 1));
+    const pool = [assetItem.id];
+    const base = { ...assetItem, quantity: 1 };
+    const useSerialPlaceholder = assetUsesSerialNumber(base);
+    if (count > 1 && useSerialPlaceholder && !String(base.serialNumber || "").trim()) {
+      base.serialNumber = nextUndefinedSerial([...expanded, base]);
+    }
+    expanded.push(base);
+    for (let index = 1; index < count; index += 1) {
+      const copyId = nextId("A", [...expanded, ...assets]);
+      const copy = {
+        ...JSON.parse(JSON.stringify(assetItem)),
+        id: copyId,
+        quantity: 1,
+        imageData: "",
+        serialNumber: useSerialPlaceholder ? nextUndefinedSerial(expanded) : "",
+        notes: assetItem.notes || ""
+      };
+      expanded.push(copy);
+      pool.push(copyId);
+    }
+    if (pool.length > 1) pools.set(assetItem.id, pool);
+  });
+  return { assets: expanded, pools };
+}
+
+function remapExpandedAssetReferences(testEvents, pools) {
+  if (!pools.size) return testEvents;
+  const nextEvents = testEvents.map((testEvent) => ({
+    ...testEvent,
+    operatorAssetIds: Array.isArray(testEvent.operatorAssetIds) ? [...testEvent.operatorAssetIds] : [],
+    requiredAssetIds: Array.isArray(testEvent.requiredAssetIds) ? [...testEvent.requiredAssetIds] : [],
+    equipmentRoles: Array.isArray(testEvent.equipmentRoles)
+      ? testEvent.equipmentRoles.map((role) => ({
+        ...role,
+        assignedAssetIds: Array.isArray(role.assignedAssetIds) ? [...role.assignedAssetIds] : []
+      }))
+      : []
+  }));
+  const allocations = new Map();
+  const assignedEvents = (assetId) => allocations.get(assetId) || [];
+  const reserve = (assetId, testEvent) => {
+    if (!allocations.has(assetId)) allocations.set(assetId, []);
+    allocations.get(assetId).push(testEvent);
+    return assetId;
+  };
+  const chooseAsset = (assetId, testEvent, eventChoices) => {
+    if (!assetId) return "";
+    const pool = pools.get(assetId);
+    if (!pool) return reserve(assetId, testEvent);
+    const openAssetId = pool.find((candidateId) => !eventChoices.has(candidateId) && !assignedEvents(candidateId).some((assignedEvent) => overlaps(assignedEvent, testEvent)));
+    const fallbackAssetId = openAssetId || pool.find((candidateId) => !eventChoices.has(candidateId)) || pool[0];
+    eventChoices.add(fallbackAssetId);
+    return reserve(fallbackAssetId, testEvent);
+  };
+
+  nextEvents
+    .map((testEvent, index) => ({ testEvent, index }))
+    .sort((a, b) => String(a.testEvent.startDate || "").localeCompare(String(b.testEvent.startDate || "")) || a.index - b.index)
+    .forEach(({ testEvent }) => {
+      const eventChoices = new Set();
+      const originalStationAssetId = testEvent.stationAssetId;
+      const originalOperatorIds = operatorIdsForEvent(testEvent);
+      const hasEquipmentRoles = Boolean((testEvent.equipmentRoles || []).length);
+      if (testEvent.stationAssetId) testEvent.stationAssetId = chooseAsset(testEvent.stationAssetId, testEvent, eventChoices);
+      const operatorIds = originalOperatorIds.map((assetId) => chooseAsset(assetId, testEvent, eventChoices));
+      testEvent.operatorAssetIds = uniqueIds(operatorIds);
+      testEvent.operatorAssetId = testEvent.operatorAssetIds[0] || "";
+      testEvent.equipmentRoles = (testEvent.equipmentRoles || []).map((role) => ({
+        ...role,
+        assignedAssetIds: (role.assignedAssetIds || []).map((assetId) => chooseAsset(assetId, testEvent, eventChoices))
+      }));
+      if (hasEquipmentRoles) return;
+      testEvent.requiredAssetIds = uniqueIds((testEvent.requiredAssetIds || []).map((assetId) => {
+        if (assetId === originalStationAssetId) return testEvent.stationAssetId;
+        const operatorIndex = originalOperatorIds.indexOf(assetId);
+        if (operatorIndex >= 0) return testEvent.operatorAssetIds[operatorIndex] || "";
+        return chooseAsset(assetId, testEvent, eventChoices);
+      }));
+    });
+  return nextEvents;
+}
+
+function normalizeDutDependencyMap(dependencyMap = {}) {
+  return Object.fromEntries(Object.entries(dependencyMap || {}).map(([dutType, dependencies]) => [
+    dutType,
+    normalizeDutDependencies(dependencies)
+  ]).filter(([dutType, dependencies]) => dutType && dependencies.length));
+}
+
+function normalizeDutDependencies(dependencies = []) {
+  return dependencies.map((dependency) => ({
+    assetType: String(dependency.assetType || "").trim(),
+    quantity: Math.max(1, Number(dependency.quantity) || 1),
+    requirements: String(dependency.requirements || "").trim()
+  })).filter((dependency) => dependency.assetType);
+}
+
+function syncDutAssetsFromUuts(nextState, uutNames) {
+  uutNames.filter(Boolean).forEach((uutName) => {
+    const existing = nextState.assets.find((assetItem) => comparableText(assetItem.name) === comparableText(uutName) && (assetItem.isDut || (!assetItem.isStation && !assetItem.isRack && !assetItem.isOperator)));
+    if (existing) {
+      existing.isDut = true;
+      existing.isStation = false;
+      existing.isRack = false;
+      existing.isOperator = false;
+      existing.stationGroupId = "";
+      existing.assetTypes = unique([...assetTypesFor(existing), DUT_TYPE]);
+      existing.assetType = existing.assetTypes[0] || DUT_TYPE;
+      existing.dutType = existing.dutType || "";
+      existing.quantity = 1;
+      return;
+    }
+    const nextIdValue = nextId("A", nextState.assets);
+    nextState.assets.push({
+      id: nextIdValue,
+      manufacturer: "",
+      name: uutName,
+      assetType: DUT_TYPE,
+      assetTypes: [DUT_TYPE],
+      stationGroupId: "",
+      isStation: false,
+      isRack: false,
+      isOperator: false,
+      isDut: true,
+      dutType: "",
+      quantity: 1,
+      serialNumber: "",
+      owner: "",
+      status: "Available",
+      calibrationRequired: false,
+      calibrationDueDate: "",
+      capabilities: "",
+      imagePath: "",
+      imageData: "",
+      notes: "Created from an event UUT."
+    });
+  });
 }
 
 function normalizeEquipmentRoles(roles, legacyEquipmentIds, assetsById) {
@@ -270,6 +443,52 @@ function equipmentTypeOptions(extraTypes = []) {
   ]);
 }
 
+function dutTypeOptions(extraTypes = []) {
+  return unique([
+    ...Object.keys(state.settings.dutTypeDependencies || {}),
+    ...state.assets.filter((assetItem) => assetKind(assetItem) === "dut").map((assetItem) => assetItem.dutType),
+    ...extraTypes
+  ]);
+}
+
+function dutAssetForUut(uutName, assets = state.assets) {
+  const normalized = comparableText(uutName);
+  if (!normalized) return null;
+  return assets.find((assetItem) => assetKind(assetItem) === "dut" && comparableText(assetItem.name) === normalized) || null;
+}
+
+function dutTypeForUut(uutName) {
+  return dutAssetForUut(uutName)?.dutType || "";
+}
+
+function dutDependenciesForType(dutType) {
+  return (state.settings.dutTypeDependencies || {})[dutType] || [];
+}
+
+function dependencyRoleKey(role) {
+  return `${comparableText(role.assetType)}|${comparableText(role.requirements)}`;
+}
+
+function applyDutDependenciesToRoles(roles, dutType) {
+  const dependencies = dutDependenciesForType(dutType);
+  if (!dependencies.length) return roles;
+  const existingKeys = new Set(roles.map(dependencyRoleKey));
+  const nextRoles = [...roles];
+  dependencies.forEach((dependency) => {
+    if (!dependency.assetType) return;
+    const key = dependencyRoleKey(dependency);
+    if (existingKeys.has(key)) return;
+    existingKeys.add(key);
+    nextRoles.push(equipmentRole(nextRoleIdForRoles(nextRoles), dependency.assetType, dependency.assetType, dependency.quantity || 1, [], dependency.requirements || ""));
+  });
+  return nextRoles;
+}
+
+function nextRoleIdForRoles(roles) {
+  const highest = roles.reduce((max, role) => Math.max(max, Number(String(role.id || "").replace("R-", "")) || 0), 0);
+  return `R-${String(highest + 1).padStart(3, "0")}`;
+}
+
 function rememberEquipmentType(assetType) {
   const normalized = String(assetType || "").trim();
   if (!normalized) return "";
@@ -299,20 +518,104 @@ function assetMatchesType(assetItem, assetType) {
   return !assetType || assetTypesFor(assetItem).includes(assetType);
 }
 
+function assetKind(assetItem = {}) {
+  if (assetItem.isOperator) return "operator";
+  if (assetItem.isDut || assetTypesFor(assetItem).includes(DUT_TYPE)) return "dut";
+  if (assetItem.isRack || assetTypesFor(assetItem).includes(RACK_TYPE)) return "rack";
+  return "asset";
+}
+
+function assetCategory(assetItem = {}) {
+  const kind = assetKind(assetItem);
+  if (kind === "rack") return "rack";
+  if (kind === "asset") return "testEquipment";
+  return kind;
+}
+
+function assetMatchesCategory(assetItem, category) {
+  return !category || assetCategory(assetItem) === category;
+}
+
+function assetMatchesSearch(assetItem, searchText, assetsById = byId(state.assets)) {
+  const query = comparableText(searchText);
+  if (!query) return true;
+  const haystack = [
+    assetItem.id,
+    assetItem.manufacturer,
+    assetItem.name,
+    assetDisplayName(assetItem),
+    assetTypeText(assetItem),
+    assetItem.dutType,
+    assetItem.serialNumber,
+    assetItem.owner,
+    assetItem.status,
+    stationGroupLabel(assetItem.stationGroupId, assetsById),
+    assetItem.capabilities,
+    assetItem.notes
+  ].map(comparableText).join(" ");
+  return haystack.includes(query);
+}
+
+function assetCategoryLabel(category) {
+  return {
+    testEquipment: "Test Equipment",
+    dut: "DUT",
+    rack: "Racks",
+    operator: "Test Operators"
+  }[category] || "All assets";
+}
+
 function stationGroupOptions(currentAssetId = "") {
   return state.assets
-    .filter((assetItem) => assetItem.isStation && assetItem.id !== currentAssetId)
+    .filter((assetItem) => assetItem.isRack && assetItem.id !== currentAssetId)
     .map((assetItem) => ({ value: assetItem.id, label: assetOptionLabel(assetItem) }));
 }
 
 function stationGroupAssets(stationGroupId) {
   if (!stationGroupId) return [];
-  return state.assets.filter((assetItem) => assetItem.stationGroupId === stationGroupId && !assetItem.isStation && !assetItem.isOperator);
+  return state.assets.filter((assetItem) => assetItem.stationGroupId === stationGroupId && !assetItem.isRack && !assetItem.isOperator && !assetItem.isDut);
 }
 
 function stationGroupLabel(stationGroupId, assetsById = byId(state.assets)) {
   const station = assetsById.get(stationGroupId);
   return station ? assetDisplayName(station) || station.name || station.id : "";
+}
+
+function rackIdForName(rackName, currentAssetId = "") {
+  const normalized = comparableText(rackName);
+  if (!normalized) return "";
+  const match = stationGroupOptions(currentAssetId).find((option) => comparableText(option.label) === normalized || comparableText(option.value) === normalized);
+  return match?.value || "";
+}
+
+function createRack(rackName, { owner = "", reservedAssetId = "" } = {}) {
+  const rackId = nextId("A", reservedAssetId ? [...state.assets, { id: reservedAssetId }] : state.assets);
+  const rack = {
+    ...emptyAsset(),
+    id: rackId,
+    manufacturer: "",
+    name: rackName,
+    assetTypes: [RACK_TYPE],
+    assetType: RACK_TYPE,
+    stationGroupId: "",
+    quantity: 1,
+    serialNumber: "",
+    owner,
+    status: "Available",
+    calibrationRequired: false,
+    calibrationDueDate: "",
+    imagePath: "",
+    imageData: "",
+    capabilities: "",
+    notes: "Created while assigning an asset to a rack.",
+    isStation: false,
+    isRack: true,
+    isOperator: false,
+    isDut: false
+  };
+  state.assets.push(rack);
+  rememberEquipmentType(RACK_TYPE);
+  return rack;
 }
 
 function comparableText(text) {
@@ -327,10 +630,11 @@ function assetDuplicateMatches(candidate, currentAssetId = "") {
   return state.assets.filter((assetItem) => {
     if (assetItem.id === currentAssetId) return false;
     const assetSerial = comparableText(assetItem.serialNumber);
-    const serialMatch = candidateSerial && assetSerial === candidateSerial;
     const manufacturerMatch = !candidateManufacturer || comparableText(assetItem.manufacturer) === candidateManufacturer;
     const nameMatch = candidateName && comparableText(assetItem.name) === candidateName;
     const typeMatch = candidateTypes.length && assetTypesFor(assetItem).map(comparableText).some((assetType) => candidateTypes.includes(assetType));
+    const sameInventoryFamily = manufacturerMatch && (nameMatch || typeMatch);
+    const serialMatch = candidateSerial && assetSerial === candidateSerial && sameInventoryFamily;
     const untrackedSerializedCopy = !candidateSerial && !assetSerial && manufacturerMatch && nameMatch && typeMatch;
     return serialMatch || untrackedSerializedCopy;
   });
@@ -345,6 +649,17 @@ function assetDuplicateWarningText(matches) {
 
 function assetIdentity(assetItem) {
   return assetItem.serialNumber ? `SN ${assetItem.serialNumber}` : "No serial number";
+}
+
+function assetUsesSerialNumber(assetItem) {
+  return !assetItem.isOperator && !assetItem.isRack;
+}
+
+function nextUndefinedSerial(assets = state.assets) {
+  const used = new Set(assets.map((assetItem) => comparableText(assetItem.serialNumber)));
+  let index = 1;
+  while (used.has(comparableText(`Undefined ${index}`))) index += 1;
+  return `Undefined ${index}`;
 }
 
 function assetDisplayName(assetItem) {
@@ -479,6 +794,10 @@ function setActiveView(viewName) {
   activeView = viewName;
   document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === activeView));
   document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${activeView}`));
+  const scheduleFilters = document.getElementById("scheduleFilters");
+  if (scheduleFilters) scheduleFilters.hidden = !["schedule", "events"].includes(activeView);
+  const scheduleViewModeField = document.getElementById("scheduleViewModeField");
+  if (scheduleViewModeField) scheduleViewModeField.hidden = activeView !== "schedule";
 }
 
 function openAssetModal() {
@@ -497,31 +816,49 @@ function assetDraftKey(id = selectedAssetId) {
   return id || NEW_ASSET_DRAFT_KEY;
 }
 
+function syncAssetCalibrationRequiredFromDate() {
+  const dueDateEl = document.getElementById("asset-calibrationDueDate");
+  const requiredEl = document.getElementById("asset-calibrationRequired");
+  if (dueDateEl?.value && requiredEl) requiredEl.checked = true;
+}
+
 function saveAssetDraftFromForm() {
   const formEl = document.getElementById("assetForm");
   const modalEl = document.getElementById("assetModal");
   if (!formEl || modalEl.hidden || !formEl.innerHTML.trim()) return;
   const form = new FormData(formEl);
-  const assetTypes = readAssetTypesFromForm(formEl, true);
+  const kind = formValue(form, "assetKind") || "asset";
+  const isOperator = kind === "operator";
+  const isRack = kind === "rack";
+  const isDut = kind === "dut";
+  const isStation = !isOperator && !isRack && !isDut && form.has("isStation");
+  const assetTypes = isOperator ? [TEST_OPERATOR_TYPE] : isDut ? [DUT_TYPE] : isRack ? [RACK_TYPE] : readAssetTypesFromForm(formEl, true);
+  const calibrationDueDate = isOperator || isDut || isRack ? "" : formValue(form, "calibrationDueDate");
   assetDrafts.set(assetDraftKey(selectedAssetId), {
     id: formValue(form, "id"),
-    manufacturer: formText(form, "manufacturer"),
+    manufacturer: isOperator || isDut || isRack ? "" : formText(form, "manufacturer"),
     name: formText(form, "name"),
     assetTypes,
     assetType: assetTypes[0] || "",
-    stationGroupId: "",
-    quantity: Number(formValue(form, "quantity")) || 1,
-    serialNumber: formText(form, "serialNumber"),
+    stationGroupId: !isOperator && !isRack && !isDut ? rackIdForName(formText(form, "stationGroupName"), formValue(form, "id")) : "",
+    rackName: !isOperator && !isRack && !isDut ? formText(form, "stationGroupName") : "",
+    quantity: 1,
+    serialNumber: isOperator || isRack ? "" : formText(form, "serialNumber"),
     owner: formText(form, "owner"),
     status: formValue(form, "status") || "Available",
-    calibrationRequired: form.has("calibrationRequired"),
-    calibrationDueDate: formValue(form, "calibrationDueDate"),
-    imagePath: formText(form, "imagePath"),
-    imageData: formValue(form, "imageData"),
-    capabilities: formText(form, "capabilities"),
+    calibrationRequired: !isOperator && !isDut && !isRack && (form.has("calibrationRequired") || Boolean(calibrationDueDate)),
+    calibrationDueDate,
+    imagePath: isOperator || isDut || isRack ? "" : formText(form, "imagePath"),
+    imageData: isOperator || isDut || isRack ? "" : formValue(form, "imageData"),
+    capabilities: isOperator || isDut || isRack ? "" : formText(form, "capabilities"),
     notes: formText(form, "notes"),
-    isStation: form.has("isStation"),
-    isOperator: form.has("isOperator")
+    dutType: isDut ? formText(form, "dutType") : "",
+    dutDependencies: isDut ? readDutDependenciesFromForm(formEl) : [],
+    stationGroupMemberIds: isRack ? formValues(form, "stationGroupMemberIds[]") : [],
+    isStation,
+    isRack,
+    isOperator,
+    isDut
   });
 }
 
@@ -549,12 +886,14 @@ function saveEventDraftFromForm() {
   const id = formValue(form, "id");
   const eventCategory = formValue(form, "eventCategory") || "Test";
   const operatorAssetIds = selectedOperatorIdsFromForm(form);
+  const uut = eventUsesUut(eventCategory) ? formText(form, "uut") : "";
+  const equipmentRoles = eventUsesEquipment(eventCategory) ? applyDutDependenciesToRoles(readEquipmentRolesFromForm(), dutTypeForUut(uut)) : [];
   eventDrafts.set(eventDraftKey(selectedEventId), {
     id,
     name: formText(form, "name"),
     eventCategory,
     program: formText(form, "program"),
-    uut: eventUsesUut(eventCategory) ? formText(form, "uut") : "",
+    uut,
     testType: eventCategory === "Test" ? formText(form, "testType") : "",
     startDate: formValue(form, "startDate"),
     endDate: formValue(form, "endDate"),
@@ -563,7 +902,7 @@ function saveEventDraftFromForm() {
     operatorAssetId: operatorAssetIds[0] || "",
     operatorAssetIds,
     requiredAssetIds: [],
-    equipmentRoles: eventUsesEquipment(eventCategory) ? readEquipmentRolesFromForm() : [],
+    equipmentRoles,
     priority: formValue(form, "priority") || "Medium",
     owner: formText(form, "owner"),
     status: formValue(form, "status") || "Draft",
@@ -617,7 +956,7 @@ function detectConflicts(events = state.testEvents) {
           programs: [...new Set([first.program, second.program].filter(Boolean))],
           severity: severityFor([first, second], window),
           explanation: `${first.name} and ${second.name} require ${combinedDemand} total use${combinedDemand === 1 ? "" : "s"} of ${conflictedAsset.name} from ${window.startDate} to ${window.endDate}. ${conflictedAsset.name} supports ${capacity} concurrent use${capacity === 1 ? "" : "s"}.`,
-          suggestedResolution: conflictedAsset.isStation ? "Reschedule one event or move an event to another station." : conflictedAsset.isOperator ? "Assign a different qualified operator or reschedule one event." : "Reschedule, substitute the asset, or buy/rent/borrow additional capacity."
+          suggestedResolution: conflictedAsset.isStation ? "Reschedule one event or move an event to another station." : conflictedAsset.isOperator ? "Assign a different qualified operator or reschedule one event." : "Reschedule, substitute another asset, or add another inventory item."
         });
       });
     }
@@ -640,7 +979,7 @@ function detectConflicts(events = state.testEvents) {
       programs: [...new Set(activeEvents.map((testEvent) => testEvent.program).filter(Boolean))],
       severity: severityFor(activeEvents, { startDate: peak.dates, endDate: peak.dates }),
       explanation: `${assetItem.name} has peak demand of ${peak.count} concurrent events on ${peak.dates}, exceeding available capacity of ${capacity}.`,
-      suggestedResolution: assetItem.isStation ? "Move one or more events to another station or reschedule." : assetItem.isOperator ? "Assign another operator or reschedule lower-priority events." : "Add capacity, substitute compatible assets, or reschedule lower-priority events."
+      suggestedResolution: assetItem.isStation ? "Move one or more events to another station or reschedule." : assetItem.isOperator ? "Assign another operator or reschedule lower-priority events." : "Add compatible inventory, substitute compatible assets, or reschedule lower-priority events."
     });
   });
 
@@ -659,7 +998,7 @@ function detectConflicts(events = state.testEvents) {
           programs: [testEvent.program].filter(Boolean),
           severity: testEvent.priority === "Critical" ? "High" : "Medium",
           explanation: `${testEvent.name} needs ${quantity} ${role.assetType || role.label || "equipment"} role${quantity === 1 ? "" : "s"}, but only ${assignedCount} ${assignedCount === 1 ? "is" : "are"} assigned.`,
-          suggestedResolution: "Assign matching inventory, add inventory capacity, or revise the role quantity."
+          suggestedResolution: "Assign matching inventory, add another inventory item, or revise the role quantity."
         });
       }
     });
@@ -785,7 +1124,7 @@ function renderFilters() {
   fillSelect("uutFilter", uutFilterOptions(), value("programFilter") ? "All UUTs for program" : "All UUTs", value("uutFilter"));
   fillSelect("stationFilter", state.assets.filter((item) => item.isStation).map((item) => ({ value: item.id, label: assetDisplayName(item) || item.name })), "All stations", value("stationFilter"));
   fillSelect("ownerFilter", unique([...state.testEvents.map((item) => item.owner), ...state.assets.map((item) => item.owner)]), "All owners", value("ownerFilter"));
-  fillSelect("assetTypeFilter", equipmentTypeOptions(), "All types", value("assetTypeFilter"));
+  fillSelect("assetTypeFilter", assetTypeFilterOptions(), "All types", value("assetTypeFilter"));
   renderAssetFilterState();
 }
 
@@ -804,13 +1143,20 @@ function fillSelect(id, options, emptyLabel, selected) {
   select.value = normalized.some((option) => option.value === selected) ? selected : "";
 }
 
+function assetTypeFilterOptions(category = value("assetCategoryFilter")) {
+  return unique(state.assets
+    .filter((assetItem) => assetMatchesCategory(assetItem, category))
+    .flatMap((assetItem) => assetTypesFor(assetItem)));
+}
+
 function renderAssetFilterState() {
   const clearButton = document.getElementById("clearAssetTypeFilterBtn");
-  if (!clearButton) return;
   const activeType = value("assetTypeFilter");
-  clearButton.hidden = !activeType;
-  clearButton.textContent = activeType ? `Clear Type: ${activeType}` : "Clear Type Filter";
-  clearButton.title = activeType ? `Clear type filter: ${activeType}` : "";
+  if (clearButton) {
+    clearButton.hidden = !activeType;
+    clearButton.textContent = activeType ? `Clear Type: ${activeType}` : "Clear Type Filter";
+    clearButton.title = activeType ? `Clear type filter: ${activeType}` : "";
+  }
 }
 
 function renderDashboard() {
@@ -835,45 +1181,65 @@ function metric(label, valueText, detail) {
 
 function renderAssetForm() {
   const item = assetDrafts.get(assetDraftKey()) || state.assets.find((assetItem) => assetItem.id === selectedAssetId) || emptyAsset();
+  const kind = assetKind(item);
+  const isOperator = kind === "operator";
+  const isRack = kind === "rack";
+  const isDut = kind === "dut";
   document.getElementById("assetForm").innerHTML = `
     <input type="hidden" name="id" value="${escapeHtml(item.id)}">
-    <input type="hidden" id="asset-imageData" name="imageData" value="${escapeHtml(item.imageData || "")}">
-    ${assetImageInput(item)}
     <div class="form-row">
       ${input("Asset ID", "idVisible", item.id, "text", true)}
-      ${input("Manufacturer", "manufacturer", item.manufacturer)}
+      ${assetKindInput(kind)}
     </div>
-    <div class="form-row">
-      ${input("Asset Name", "name", item.name)}
-      ${assetTypeInput(item)}
-    </div>
-    <div class="form-row">
-      ${input("Scheduling Capacity", "quantity", item.quantity, "number")}
-      ${input("Serial Number", "serialNumber", item.serialNumber)}
-    </div>
-    <div class="form-row">
-      ${input("Owner", "owner", item.owner)}
-      ${select("Status", "status", ["Available", "Down", "Out for Calibration", "Retired", "Limited Use", "Unknown"], item.status)}
-    </div>
-    <div class="form-row">
-      ${input("Calibration Due Date", "calibrationDueDate", item.calibrationDueDate, "date")}
-      ${assetStationGroupInput(item)}
-    </div>
-    <div class="form-row">
-      <div class="field">
-        <label>Flags</label>
-        <div class="checkbox-row"><input id="asset-isStation" name="isStation" type="checkbox" ${item.isStation ? "checked" : ""}><span>Is Station?</span></div>
-        <div class="checkbox-row"><input id="asset-isOperator" name="isOperator" type="checkbox" ${item.isOperator ? "checked" : ""}><span>Test Operator?</span></div>
-        <div class="checkbox-row"><input id="asset-calibrationRequired" name="calibrationRequired" type="checkbox" ${item.calibrationRequired ? "checked" : ""}><span>Calibration Required?</span></div>
+    ${isOperator || isDut || isRack ? `
+      <input type="hidden" name="assetTypes[]" value="${isOperator ? TEST_OPERATOR_TYPE : isDut ? DUT_TYPE : RACK_TYPE}">
+      <div class="form-row">
+        ${assetTextInput(isOperator ? "Person Name" : isDut ? "DUT Name" : "Rack Name", "name", item.name)}
+        ${isDut ? dutTypeInput(item) : assetTextInput(isOperator ? "Team / Org" : "Owner", "owner", item.owner)}
       </div>
-    </div>
-    ${item.isStation ? stationGroupMemberEditor(item) : ""}
-    ${textarea("Capabilities", "capabilities", item.capabilities)}
+      ${isDut ? `<div class="form-row">
+        ${assetTextInput("Serial Number", "serialNumber", item.serialNumber)}
+        ${assetTextInput("Owner", "owner", item.owner)}
+      </div>` : ""}
+      <div class="form-row">
+        ${select("Status", "status", ["Available", "Down", "Retired", "Limited Use", "Unknown"], item.status)}
+      </div>
+      ${isDut ? dutDependencyEditor(item.dutType || "", item.dutDependencies) : ""}
+      ${isRack ? stationGroupMemberEditor(item) : ""}
+    ` : `
+      <input type="hidden" id="asset-imageData" name="imageData" value="${escapeHtml(item.imageData || "")}">
+      ${assetImageInput(item)}
+      <div class="form-row">
+        ${input("Manufacturer", "manufacturer", item.manufacturer)}
+        ${input("Asset Name", "name", item.name)}
+      </div>
+      <div class="form-row">
+        ${assetTypeInput(item)}
+        ${assetStationGroupInput(item)}
+      </div>
+      <div class="form-row">
+        ${input("Serial Number", "serialNumber", item.serialNumber)}
+        ${input("Owner", "owner", item.owner)}
+      </div>
+      <div class="form-row">
+        ${select("Status", "status", ["Available", "Down", "Out for Calibration", "Retired", "Limited Use", "Unknown"], item.status)}
+        <div class="field">
+          <label>Flags</label>
+          <div class="checkbox-row"><input id="asset-isStation" name="isStation" type="checkbox" ${item.isStation ? "checked" : ""}><span>Test Station?</span></div>
+          <div class="checkbox-row"><input id="asset-calibrationRequired" name="calibrationRequired" type="checkbox" ${item.calibrationRequired ? "checked" : ""}><span>Calibration Required?</span></div>
+        </div>
+      </div>
+      <div class="form-row">
+        ${input("Calibration Due Date", "calibrationDueDate", item.calibrationDueDate, "date")}
+        
+      </div>
+      ${textarea("Capabilities", "capabilities", item.capabilities)}
+    `}
     ${textarea("Notes", "notes", item.notes)}
-    <div id="assetTypeRequiredWarning" class="form-warning" aria-live="polite" hidden>At least one asset type is required.</div>
+    ${isOperator || isDut || isRack ? "" : `<div id="assetTypeRequiredWarning" class="form-warning" aria-live="polite" hidden>At least one asset type is required.</div>`}
     <div id="assetDuplicateWarning" class="form-warning" aria-live="polite" hidden></div>
     <div class="form-actions">
-      <button type="submit">${selectedAssetId ? "Save Asset" : "Create Asset"}</button>
+      <button type="submit">${selectedAssetId ? `Save ${isOperator ? "Operator" : isDut ? "DUT" : isRack ? "Rack" : "Asset"}` : `Create ${isOperator ? "Operator" : isDut ? "DUT" : isRack ? "Rack" : "Asset"}`}</button>
       <button type="button" class="secondary" id="cancelAssetBtn">Cancel</button>
     </div>
   `;
@@ -937,7 +1303,7 @@ function renderEventForm() {
       <button type="button" class="secondary" id="cancelEventBtn">Cancel</button>
     </div>
   `;
-  if (eventUsesEquipment(eventCategory)) renderEquipmentRolesFrom(item.equipmentRoles || []);
+  if (eventUsesEquipment(eventCategory)) renderEquipmentRolesFrom(applyDutDependenciesToRoles(item.equipmentRoles || [], dutTypeForUut(item.uut)));
   syncEventEndDateBounds();
 }
 
@@ -955,7 +1321,7 @@ function refreshEventEquipmentRoles() {
   const eventId = formValue(new FormData(document.getElementById("eventForm")), "id");
   const startDate = value("event-startDate");
   const endDate = value("event-endDate");
-  const roles = readEquipmentRolesFromForm();
+  const roles = applyDutDependenciesToRoles(readEquipmentRolesFromForm(), dutTypeForUut(value("event-uut")));
   target.classList.toggle("is-empty", !roles.length);
   if (!roles.length) {
     target.innerHTML = emptyEquipmentRolesMarkup();
@@ -995,28 +1361,30 @@ function equipmentRoleAddMarkup(labelText = "Add Role") {
   return `<button type="button" class="secondary" id="addEquipmentRoleBtn">${escapeHtml(labelText)}</button>`;
 }
 
-function renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptions = equipmentTypeOptions()) {
+function renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptions = equipmentTypeOptions(), allRoles = []) {
   const matchingAssets = state.assets.filter((assetItem) => assetMatchesType(assetItem, role.assetType));
   const quantity = Math.max(1, Number(role.quantity) || 1);
   const assigned = (role.assignedAssetIds || []).slice(0, quantity);
   const openSlots = Array.from({ length: quantity }, (_, slotIndex) => assigned[slotIndex] || "");
   const statusClass = assigned.filter(Boolean).length >= quantity ? "ok" : "medium";
+  const fillText = quantity === 1 ? assigned.filter(Boolean).length ? "Assigned" : "Open" : `${assigned.filter(Boolean).length}/${quantity}`;
   const matchText = role.assetType ? `${matchingAssets.length} match${matchingAssets.length === 1 ? "" : "es"}` : "Set type";
   return `
     <section class="equipment-role" data-role-index="${index}">
       <input type="hidden" name="equipmentRoleId[]" value="${escapeHtml(role.id)}">
       <input type="hidden" name="equipmentRoleLabel[]" value="${escapeHtml(role.assetType || role.label || "")}">
       <input type="hidden" name="equipmentRoleCommittedType[]" value="${escapeHtml(role.assetType || "")}">
+      <input type="hidden" name="equipmentRoleRequirements[]" value="${escapeHtml(role.requirements || "")}">
+      <input type="hidden" name="equipmentRoleQuantity[]" value="${escapeHtml(quantity)}">
       <div class="role-type-cell">
         ${roleInputWithDatalist("Type", "equipmentRoleType[]", role.assetType, typeOptions, index)}
+        ${role.requirements ? `<small class="role-requirement">${escapeHtml(role.requirements)}</small>` : ""}
       </div>
-      ${roleInput("Need", "equipmentRoleRequirements[]", role.requirements, index)}
-      ${roleInput("Qty", "equipmentRoleQuantity[]", quantity, index, "number")}
       <div class="role-assignment-cell">
-        ${openSlots.map((assetId, slotIndex) => renderRoleAssignment(role, index, slotIndex, assetId, matchingAssets, startDate, endDate, eventId)).join("")}
+        ${openSlots.map((assetId, slotIndex) => renderRoleAssignment(role, index, slotIndex, assetId, matchingAssets, startDate, endDate, eventId, assignedEquipmentIdsOutsideSlot(allRoles, index, slotIndex))).join("")}
       </div>
-      <div class="role-status-cell">${badge(`${assigned.filter(Boolean).length}/${quantity}`, statusClass)}<small>${escapeHtml(matchText)}</small></div>
-      <button type="button" class="secondary icon-button" data-remove-equipment-role="${index}" aria-label="Remove equipment role">X</button>
+      <div class="role-status-cell">${badge(fillText, statusClass)}<small>${escapeHtml(matchText)}</small></div>
+      <button type="button" class="secondary icon-button role-remove-button" data-remove-equipment-role="${index}" aria-label="Remove equipment role">X</button>
     </section>
   `;
 }
@@ -1034,13 +1402,23 @@ function equipmentRoleHeader() {
   `;
 }
 
-function renderRoleAssignment(role, roleIndex, slotIndex, assetId, matchingAssets, startDate, endDate, eventId) {
+function assignedEquipmentIdsOutsideSlot(roles, roleIndex, slotIndex) {
+  return new Set((roles || []).flatMap((role, index) => {
+    const quantity = Math.max(1, Number(role.quantity) || 1);
+    return (role.assignedAssetIds || []).slice(0, quantity).filter((assetId, currentSlotIndex) => {
+      return assetId && (index !== roleIndex || currentSlotIndex !== slotIndex);
+    });
+  }));
+}
+
+function renderRoleAssignment(role, roleIndex, slotIndex, assetId, matchingAssets, startDate, endDate, eventId, assignedElsewhere = new Set()) {
   const selectedAsset = state.assets.find((assetItem) => assetItem.id === assetId);
   const selectedMatchesRole = selectedAsset && assetMatchesType(selectedAsset, role.assetType);
-  const options = matchingAssets.some((assetItem) => assetItem.id === assetId) || !selectedMatchesRole ? matchingAssets : [selectedAsset, ...matchingAssets];
+  const availableAssets = matchingAssets.filter((assetItem) => assetItem.id === assetId || !assignedElsewhere.has(assetItem.id));
+  const options = availableAssets.some((assetItem) => assetItem.id === assetId) || !selectedMatchesRole ? availableAssets : [selectedAsset, ...availableAssets];
   const selectedAllocation = assetId ? assetAllocation(assetId, startDate, endDate, eventId) : null;
   const helperText = matchingAssets.length
-    ? selectedAllocation?.detail || "Select a matching inventory item later, or leave this role unresolved."
+    ? selectedAllocation && selectedAllocation.level !== "open" ? selectedAllocation.detail : ""
     : role.assetType
       ? `No inventory assets match ${role.assetType}. Add a matching asset or adjust this role type.`
       : "Set the role type to see matching inventory.";
@@ -1058,7 +1436,7 @@ function renderRoleAssignment(role, roleIndex, slotIndex, assetId, matchingAsset
           }).join("")}
         </select>
       </div>
-      <small class="${selectedAllocation ? `assignment-${selectedAllocation.level}` : ""}">${escapeHtml(helperText)}</small>
+      ${helperText ? `<small class="${selectedAllocation ? `assignment-${selectedAllocation.level}` : ""}">${escapeHtml(helperText)}</small>` : ""}
     </div>
   `;
 }
@@ -1151,6 +1529,7 @@ function readEquipmentRolesFromForm() {
     if (!assignmentsByRole.has(roleIndex)) assignmentsByRole.set(roleIndex, []);
     if (selectEl.value) assignmentsByRole.get(roleIndex).push(selectEl.value);
   });
+  const assignedInEvent = new Set();
   return roleIds.map((idInput, index) => {
     const selectedType = types[index]?.value.trim() || "";
     const committedType = committedTypes[index]?.value.trim() || "";
@@ -1158,7 +1537,9 @@ function readEquipmentRolesFromForm() {
     const quantity = Math.max(1, Number(quantities[index]?.value) || 1);
     const assignedAssetIds = (assignmentsByRole.get(index) || []).filter((assetId) => {
       const assetItem = state.assets.find((item) => item.id === assetId);
-      return assetItem && assetMatchesType(assetItem, assetType);
+      if (!assetItem || !assetMatchesType(assetItem, assetType) || assignedInEvent.has(assetId)) return false;
+      assignedInEvent.add(assetId);
+      return true;
     });
     return {
       id: idInput.value || nextRoleId(index),
@@ -1169,6 +1550,44 @@ function readEquipmentRolesFromForm() {
       assignedAssetIds
     };
   });
+}
+
+function readDutDependenciesFromForm(formEl = document.getElementById("assetForm")) {
+  if (!formEl) return [];
+  const types = [...formEl.querySelectorAll('input[name="dutDependencyAssetType[]"]')];
+  const requirements = [...formEl.querySelectorAll('input[name="dutDependencyRequirements[]"]')];
+  const quantities = [...formEl.querySelectorAll('input[name="dutDependencyQuantity[]"]')];
+  return normalizeDutDependencies(types.map((typeInput, index) => ({
+    assetType: typeInput.value,
+    requirements: requirements[index]?.value || "",
+    quantity: quantities[index]?.value || 1
+  })));
+}
+
+function renderDutDependenciesFrom(dependencies) {
+  const formEl = document.getElementById("assetForm");
+  const dutType = formEl ? formText(new FormData(formEl), "dutType") : "";
+  const target = document.getElementById("dutDependencyRows");
+  if (!target || !dutType) return;
+  target.innerHTML = `
+    ${dutDependencyHeader()}
+    ${dependencies.length ? dependencies.map((dependency, index) => renderDutDependency(dependency, index)).join("") : `<div class="role-empty-row"><span>No dependencies defined for this DUT type.</span></div>`}
+    <div class="role-add-row"><button type="button" class="secondary" id="addDutDependencyBtn">Add Dependency</button></div>
+  `;
+}
+
+function addDutDependency() {
+  const dependencies = readDutDependenciesFromForm();
+  dependencies.push({ assetType: "", requirements: "", quantity: 1 });
+  renderDutDependenciesFrom(dependencies);
+  document.getElementById(`dut-dependency-${dependencies.length - 1}-type`)?.focus();
+}
+
+function removeDutDependency(index) {
+  const dependencies = readDutDependenciesFromForm();
+  dependencies.splice(index, 1);
+  renderDutDependenciesFrom(dependencies);
+  saveAssetDraftFromForm();
 }
 
 function nextRoleId(offset = 0) {
@@ -1217,18 +1636,39 @@ function renderEquipmentRolesFrom(roles) {
   target.classList.toggle("is-empty", !roles.length);
   const typeOptions = equipmentTypeOptions(roles.map((role) => role.assetType));
   target.innerHTML = roles.length
-    ? `${equipmentRoleHeader()}${roles.map((role, index) => renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptions)).join("")}<div class="role-add-row">${equipmentRoleAddMarkup("Add Role")}</div>`
+    ? `${equipmentRoleHeader()}${roles.map((role, index) => renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptions, roles)).join("")}<div class="role-add-row">${equipmentRoleAddMarkup("Add Role")}</div>`
     : emptyEquipmentRolesMarkup();
 }
 
 function input(labelText, name, inputValue, type = "text", disabled = false) {
-  const prefix = labelText.startsWith("Asset") || ["Manufacturer", "Quantity", "Scheduling Capacity", "Status", "Serial Number", "Calibration Due Date"].includes(labelText) ? "asset" : "event";
+  const prefix = labelText.startsWith("Asset") || ["Manufacturer", "Quantity", "Status", "Serial Number", "Calibration Due Date"].includes(labelText) ? "asset" : "event";
   return `<div class="field"><label for="${prefix}-${name}">${labelText}</label><input id="${prefix}-${name}" name="${name}" type="${type}" value="${escapeHtml(inputValue ?? "")}" ${disabled ? "disabled" : ""}></div>`;
+}
+
+function assetTextInput(labelText, name, inputValue, type = "text", disabled = false) {
+  return `<div class="field"><label for="asset-${name}">${labelText}</label><input id="asset-${name}" name="${name}" type="${type}" value="${escapeHtml(inputValue ?? "")}" ${disabled ? "disabled" : ""}></div>`;
 }
 
 function inputWithDatalist(labelText, name, inputValue, options) {
   const listId = `event-${name}-options`;
   return `<div class="field"><label for="event-${name}">${labelText}</label><input id="event-${name}" name="${name}" list="${listId}" value="${escapeHtml(inputValue ?? "")}"><datalist id="${listId}">${options.map((option) => `<option value="${escapeHtml(option)}"></option>`).join("")}</datalist></div>`;
+}
+
+function assetKindInput(kind) {
+  const options = [
+    { value: "asset", label: "Test Equipment" },
+    { value: "dut", label: "DUT" },
+    { value: "rack", label: "Rack" },
+    { value: "operator", label: "Test Operator" }
+  ];
+  return `
+    <div class="field">
+      <label for="asset-kind">Record Type</label>
+      <select id="asset-kind" name="assetKind">
+        ${options.map((option) => `<option value="${option.value}" ${option.value === kind ? "selected" : ""}>${option.label}</option>`).join("")}
+      </select>
+    </div>
+  `;
 }
 
 function assetTypeInput(item) {
@@ -1246,45 +1686,175 @@ function assetTypeInput(item) {
   `;
 }
 
-function assetStationGroupInput(item) {
-  const options = stationGroupOptions(item.id);
-  const selected = options.some((option) => option.value === item.stationGroupId) ? item.stationGroupId : "";
+function dutTypeInput(item) {
+  const options = dutTypeOptions([item.dutType]);
   return `
     <div class="field">
-      <label for="asset-stationGroupId">Station Group</label>
-      <select id="asset-stationGroupId" name="stationGroupId">
-        <option value="">No station group</option>
-        ${options.map((option) => `<option value="${escapeHtml(option.value)}" ${option.value === selected ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
-      </select>
+      <label for="asset-dutType">DUT Type</label>
+      <input id="asset-dutType" name="dutType" list="asset-dut-type-options" value="${escapeHtml(item.dutType || "")}" placeholder="Select or type a DUT type">
+      <datalist id="asset-dut-type-options">${options.map((option) => `<option value="${escapeHtml(option)}"></option>`).join("")}</datalist>
     </div>
   `;
 }
 
+function dutDependencyEditor(dutType, dependenciesOverride = null) {
+  const dependencies = dutType ? dependenciesOverride || dutDependenciesForType(dutType) : [];
+  return `
+    <div class="field dut-dependency-editor">
+      <label>DUT Type Dependencies</label>
+      ${dutType ? `
+        <div id="dutDependencyRows" class="dut-dependency-list">
+          ${dutDependencyHeader()}
+          ${dependencies.length ? dependencies.map((dependency, index) => renderDutDependency(dependency, index)).join("") : `<div class="role-empty-row"><span>No dependencies defined for this DUT type.</span></div>`}
+          <div class="role-add-row"><button type="button" class="secondary" id="addDutDependencyBtn">Add Dependency</button></div>
+        </div>
+      ` : `<div class="choice-list empty-choice-list">Set a DUT Type to define required equipment roles.</div>`}
+    </div>
+  `;
+}
+
+function dutDependencyHeader() {
+  return `
+    <div class="dut-dependency-header" aria-hidden="true">
+      <span>Asset Type</span>
+      <span>Need</span>
+      <span>Qty</span>
+      <span></span>
+    </div>
+  `;
+}
+
+function renderDutDependency(dependency, index) {
+  const typeOptions = equipmentTypeOptions([dependency.assetType]);
+  const needOptions = dutDependencyNeedOptions(dependency.assetType, dependency.requirements);
+  return `
+    <div class="dut-dependency-row">
+      <div class="field compact-role-field">
+        <label class="sr-only" for="dut-dependency-${index}-type">Asset Type</label>
+        <input id="dut-dependency-${index}-type" name="dutDependencyAssetType[]" list="dut-dependency-${index}-type-options" value="${escapeHtml(dependency.assetType || "")}" placeholder="Select or type">
+        <datalist id="dut-dependency-${index}-type-options">${typeOptions.map((option) => `<option value="${escapeHtml(option)}"></option>`).join("")}</datalist>
+      </div>
+      <div class="field compact-role-field">
+        <label class="sr-only" for="dut-dependency-${index}-need">Need</label>
+        <input id="dut-dependency-${index}-need" name="dutDependencyRequirements[]" list="dut-dependency-${index}-need-options" value="${escapeHtml(dependency.requirements || "")}" placeholder="${dependency.assetType ? "Select or type need" : "Choose asset type first"}">
+        <datalist id="dut-dependency-${index}-need-options">${needOptions.map((option) => `<option value="${escapeHtml(option)}"></option>`).join("")}</datalist>
+      </div>
+      <div class="field compact-role-field">
+        <label class="sr-only" for="dut-dependency-${index}-qty">Qty</label>
+        <input id="dut-dependency-${index}-qty" name="dutDependencyQuantity[]" type="number" min="1" value="${escapeHtml(dependency.quantity || 1)}">
+      </div>
+      <button type="button" class="secondary icon-button" data-remove-dut-dependency="${index}" aria-label="Remove DUT dependency">X</button>
+    </div>
+  `;
+}
+
+function dutDependencyNeedOptions(assetType, currentNeed = "") {
+  return unique([
+    currentNeed,
+    ...state.assets
+      .filter((assetItem) => assetKind(assetItem) === "asset" && assetMatchesType(assetItem, assetType))
+      .map((assetItem) => assetDisplayName(assetItem) || assetItem.name || assetItem.id)
+  ]);
+}
+
+function assetStationGroupInput(item) {
+  const options = stationGroupOptions(item.id);
+  const selectedLabel = item.rackName || stationGroupLabel(item.stationGroupId) || "";
+  return `
+    <div class="field">
+      <label for="asset-stationGroupName">Rack</label>
+      <div class="rack-combobox" data-rack-combobox>
+        <div class="rack-combobox-control">
+          <input id="asset-stationGroupName" name="stationGroupName" value="${escapeHtml(selectedLabel)}" placeholder="No rack" autocomplete="off" aria-controls="asset-rack-options" aria-expanded="false">
+          <button type="button" class="secondary icon-button" data-toggle-rack-options aria-label="Show racks" aria-expanded="false">v</button>
+        </div>
+        <div id="asset-rack-options" class="rack-option-list" role="listbox" hidden>
+          ${options.length ? options.map((option) => `<button type="button" class="rack-option" data-rack-option="${escapeHtml(option.label)}">${escapeHtml(option.label)}</button>`).join("") : `<div class="rack-option-empty">No racks defined yet.</div>`}
+        </div>
+      </div>
+      <small>Choose an existing rack or type a new rack name.</small>
+    </div>
+  `;
+}
+
+function setRackOptionsOpen(open) {
+  const combo = document.querySelector("[data-rack-combobox]");
+  const list = document.getElementById("asset-rack-options");
+  const input = document.getElementById("asset-stationGroupName");
+  const toggle = document.querySelector("[data-toggle-rack-options]");
+  if (!combo || !list || !input || !toggle) return;
+  list.hidden = !open;
+  input.setAttribute("aria-expanded", String(open));
+  toggle.setAttribute("aria-expanded", String(open));
+}
+
+function selectRackOption(rackName) {
+  const input = document.getElementById("asset-stationGroupName");
+  if (!input) return;
+  input.value = rackName;
+  setRackOptionsOpen(false);
+  saveAssetDraftFromForm();
+}
+
 function stationGroupMemberEditor(item) {
-  const members = state.assets
-    .filter((assetItem) => assetItem.id !== item.id && !assetItem.isStation && !assetItem.isOperator)
+  const eligibleMembers = state.assets
+    .filter((assetItem) => assetItem.id !== item.id && !assetItem.isRack && !assetItem.isOperator && !assetItem.isDut)
     .sort((a, b) => assetDisplayName(a).localeCompare(assetDisplayName(b)));
-  if (!members.length) {
-    return `<div class="field station-group-editor"><label>Station Group Members</label><div class="choice-list empty-choice-list">No eligible equipment assets yet.</div></div>`;
+  if (!eligibleMembers.length) {
+    return `<div class="field station-group-editor"><label>Rack Members</label><div class="choice-list empty-choice-list">No eligible equipment assets yet.</div></div>`;
   }
+  const selectedIds = new Set(Array.isArray(item.stationGroupMemberIds) ? item.stationGroupMemberIds : stationGroupAssets(item.id).map((assetItem) => assetItem.id));
+  const currentMembers = eligibleMembers.filter((assetItem) => selectedIds.has(assetItem.id));
+  const availableMembers = eligibleMembers.filter((assetItem) => !selectedIds.has(assetItem.id));
   return `
     <div class="field station-group-editor">
-      <label>Station Group Members</label>
-      <div class="choice-list">
-        ${members.map((assetItem) => {
-          const checked = assetItem.stationGroupId === item.id;
-          const currentGroup = assetItem.stationGroupId && assetItem.stationGroupId !== item.id ? stationGroupLabel(assetItem.stationGroupId) : "";
-          const meta = [assetTypeText(assetItem), currentGroup ? `Currently in ${currentGroup}` : "Not in this group"].filter(Boolean).join(" / ");
-          return `
-            <label class="choice-row">
-              <input type="checkbox" name="stationGroupMemberIds[]" value="${escapeHtml(assetItem.id)}" ${checked ? "checked" : ""}>
-              <span><strong>${escapeHtml(assetOptionLabel(assetItem))}</strong><small>${escapeHtml(meta)}</small></span>
-            </label>
-          `;
-        }).join("")}
+      <label>Rack Members</label>
+      <div class="rack-member-list">
+        ${currentMembers.length ? currentMembers.map((assetItem) => `
+          <div class="rack-member-row">
+            <input type="hidden" name="stationGroupMemberIds[]" value="${escapeHtml(assetItem.id)}">
+            <span><strong>${escapeHtml(assetOptionLabel(assetItem))}</strong><small>${escapeHtml(assetTypeText(assetItem))}</small></span>
+            <button type="button" class="secondary icon-button" data-remove-rack-member="${escapeHtml(assetItem.id)}" aria-label="Remove ${escapeHtml(assetDisplayName(assetItem) || assetItem.id)} from rack">X</button>
+          </div>
+        `).join("") : `<div class="choice-list empty-choice-list">No members assigned yet.</div>`}
+      </div>
+      <div class="rack-member-add">
+        <select id="rackMemberToAdd">
+          <option value="">Add member</option>
+          ${availableMembers.map((assetItem) => {
+            const currentGroup = assetItem.stationGroupId && assetItem.stationGroupId !== item.id ? stationGroupLabel(assetItem.stationGroupId) : "";
+            const meta = [assetTypeText(assetItem), currentGroup ? `Currently in ${currentGroup}` : ""].filter(Boolean).join(" / ");
+            return `<option value="${escapeHtml(assetItem.id)}">${escapeHtml(`${assetOptionLabel(assetItem)}${meta ? ` (${meta})` : ""}`)}</option>`;
+          }).join("")}
+        </select>
+        <button type="button" class="secondary" id="addRackMemberBtn" ${availableMembers.length ? "" : "disabled"}>Add Member</button>
       </div>
     </div>
   `;
+}
+
+function selectedRackMemberIdsFromForm() {
+  const formEl = document.getElementById("assetForm");
+  if (!formEl) return [];
+  return formValues(new FormData(formEl), "stationGroupMemberIds[]");
+}
+
+function addRackMember() {
+  const memberId = value("rackMemberToAdd");
+  if (!memberId) return;
+  saveAssetDraftFromForm();
+  const draft = assetDrafts.get(assetDraftKey(selectedAssetId));
+  if (!draft) return;
+  draft.stationGroupMemberIds = uniqueIds([...selectedRackMemberIdsFromForm(), memberId]);
+  renderAssetForm();
+}
+
+function removeRackMember(memberId) {
+  saveAssetDraftFromForm();
+  const draft = assetDrafts.get(assetDraftKey(selectedAssetId));
+  if (!draft) return;
+  draft.stationGroupMemberIds = selectedRackMemberIdsFromForm().filter((assetId) => assetId !== memberId);
+  renderAssetForm();
 }
 
 function operatorPicker(labelText, operators, selectedIds = []) {
@@ -1309,15 +1879,15 @@ function operatorPicker(labelText, operators, selectedIds = []) {
 
 function stationGroupImportControl(stationGroups) {
   if (!stationGroups.length) {
-    return `<div class="import-group-control empty-choice-list">No station groups available to import.</div>`;
+    return `<div class="import-group-control empty-choice-list">No racks available to import.</div>`;
   }
   return `
     <div class="import-group-control">
-      <select id="event-stationGroupImportId" aria-label="Station group to import">
-        <option value="">Choose station group</option>
+      <select id="event-stationGroupImportId" aria-label="Rack to import">
+        <option value="">Choose rack</option>
         ${stationGroups.map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`).join("")}
       </select>
-      <button type="button" class="secondary" id="importStationGroupBtn">Import Equipment</button>
+      <button type="button" class="secondary" id="importStationGroupBtn">Import Rack Equipment</button>
     </div>
   `;
 }
@@ -1341,7 +1911,7 @@ function textarea(labelText, name, textValue) {
 
 function emptyAsset() {
   const next = nextId("A", state.assets);
-  return { id: next, manufacturer: "", name: "", assetType: "", assetTypes: [], stationGroupId: "", isStation: false, isOperator: false, quantity: 1, serialNumber: "", owner: "", status: "Available", calibrationRequired: false, calibrationDueDate: "", capabilities: "", imagePath: "", imageData: "", notes: "" };
+  return { id: next, manufacturer: "", name: "", assetType: "", assetTypes: [], stationGroupId: "", isStation: false, isRack: false, isOperator: false, isDut: false, quantity: 1, serialNumber: "", owner: "", status: "Available", calibrationRequired: false, calibrationDueDate: "", capabilities: "", imagePath: "", imageData: "", notes: "" };
 }
 
 function emptyEvent() {
@@ -1357,9 +1927,44 @@ function nextId(prefix, collection) {
 
 function renderAssetTable() {
   const assetTypeFilter = value("assetTypeFilter");
+  const categoryFilter = value("assetCategoryFilter");
+  const searchFilter = value("assetSearchFilter");
   const assetsById = byId(state.assets);
+  document.getElementById("assetTable")?.classList.toggle("compact-asset-table", Boolean(categoryFilter));
   renderAssetFilterState();
-  const rows = state.assets.filter((item) => assetMatchesType(item, assetTypeFilter)).map((item) => ({
+  const filteredAssets = state.assets.filter((item) => assetMatchesType(item, assetTypeFilter) && assetMatchesCategory(item, categoryFilter) && assetMatchesSearch(item, searchFilter, assetsById));
+  if (categoryFilter === "rack") {
+    const rows = filteredAssets.map((item) => {
+      const members = stationGroupAssets(item.id);
+      return {
+        id: item.id,
+        name: item.name,
+        type: assetTypeText(item),
+        members: `${members.length} member${members.length === 1 ? "" : "s"}`,
+        memberAssets: members.map((member) => assetOptionLabel(member)).join("; ") || "No member assets",
+        status: statusBadge(item.status),
+        calDue: item.calibrationRequired ? item.calibrationDueDate || "Required" : "N/A",
+        owner: item.owner,
+        actions: rowActions("asset", item.id)
+      };
+    });
+    renderAssetTableRows(["id", "name", "type", "members", "memberAssets", "status", "calDue", "owner", "actions"], rows);
+    return;
+  }
+  if (categoryFilter === "dut") {
+    const rows = filteredAssets.map((item) => ({
+      id: item.id,
+      name: item.name,
+      type: item.dutType || "Not set",
+      serial: item.serialNumber,
+      status: statusBadge(item.status),
+      owner: item.owner,
+      actions: rowActions("asset", item.id)
+    }));
+    renderAssetTableRows(["id", "name", "type", "serial", "status", "owner", "actions"], rows);
+    return;
+  }
+  const rows = filteredAssets.map((item) => ({
     picture: assetImageSource(item)
       ? `<button type="button" class="asset-thumb" data-view-asset-image="${escapeHtml(item.id)}" aria-label="View ${escapeHtml(item.name)} picture">${assetImageMarkup(item, `${item.name} picture`)}</button>`
       : `<div class="asset-thumb">${assetImageMarkup(item, `${item.name} picture`)}</div>`,
@@ -1368,17 +1973,78 @@ function renderAssetTable() {
     name: item.name,
     type: assetTypeText(item),
     serial: item.serialNumber,
-    station: item.isStation ? "Yes" : "No",
-    stationGroup: item.isStation ? `${stationGroupAssets(item.id).length} member${stationGroupAssets(item.id).length === 1 ? "" : "s"}` : stationGroupLabel(item.stationGroupId, assetsById),
-    operator: item.isOperator ? "Yes" : "No",
+    rack: item.isRack ? `${stationGroupAssets(item.id).length} member${stationGroupAssets(item.id).length === 1 ? "" : "s"}` : stationGroupLabel(item.stationGroupId, assetsById),
     status: statusBadge(item.status),
     calDue: item.calibrationRequired ? item.calibrationDueDate || "Required" : "N/A",
-    capacity: item.quantity || 1,
     capabilities: item.capabilities,
     owner: item.owner,
     actions: rowActions("asset", item.id)
   }));
-  renderTable("assetTable", ["picture", "id", "manufacturer", "name", "type", "serial", "station", "stationGroup", "operator", "status", "calDue", "capacity", "capabilities", "owner", "actions"], rows);
+  renderAssetTableRows(["picture", "id", "manufacturer", "name", "type", "serial", "rack", "status", "calDue", "capabilities", "owner", "actions"], rows);
+}
+
+function renderAssetTableRows(columns, rows) {
+  pruneAssetColumnFilters(columns);
+  const filteredRows = filterAssetRowsByColumns(rows, columns);
+  const target = document.getElementById("assetTable");
+  if (!rows.length) {
+    target.innerHTML = document.getElementById("emptyState").innerHTML;
+    return;
+  }
+  const tableHead = `<thead><tr>${columns.map((column) => `<th>${escapeHtml(labelize(column))}</th>`).join("")}</tr>${assetColumnFilterRow(columns, rows)}</thead>`;
+  if (!filteredRows.length) {
+    target.innerHTML = `<table>${tableHead}</table>${document.getElementById("emptyState").innerHTML}`;
+    return;
+  }
+  target.innerHTML = `<table>${tableHead}<tbody>${filteredRows.map((row) => `<tr>${columns.map((column) => `<td>${row[column] ?? ""}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+}
+
+function assetColumnFilterRow(columns, rows) {
+  return `<tr class="asset-column-filter-row">${columns.map((column) => `<th>${assetColumnCanFilter(column) ? assetColumnFilterSelect(column, rows) : ""}</th>`).join("")}</tr>`;
+}
+
+function assetColumnFilterSelect(column, rows) {
+  const selected = assetColumnFilters[column] || "";
+  const cellValues = rows.map((row) => cellText(row[column]));
+  const hasEmptyValues = cellValues.some((cellValue) => !cellValue);
+  const options = unique(cellValues);
+  return `
+    <select data-asset-column-filter="${escapeHtml(column)}" aria-label="Filter ${escapeHtml(labelize(column))}">
+      <option value="">All</option>
+      ${hasEmptyValues ? `<option value="${ASSET_COLUMN_EMPTY_FILTER}" ${selected === ASSET_COLUMN_EMPTY_FILTER ? "selected" : ""}>Unspecified</option>` : ""}
+      ${options.map((option) => `<option value="${escapeHtml(option)}" ${option === selected ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+    </select>
+  `;
+}
+
+function assetColumnCanFilter(column) {
+  return !["picture", "actions"].includes(column);
+}
+
+function filterAssetRowsByColumns(rows, columns) {
+  return rows.filter((row) => columns.every((column) => {
+    if (!assetColumnCanFilter(column)) return true;
+    const filterValue = assetColumnFilters[column] || "";
+    const cellValue = cellText(row[column]);
+    if (filterValue === ASSET_COLUMN_EMPTY_FILTER) return !cellValue;
+    const filterText = comparableText(filterValue);
+    return !filterText || comparableText(cellValue) === filterText;
+  }));
+}
+
+function pruneAssetColumnFilters(columns) {
+  Object.keys(assetColumnFilters).forEach((column) => {
+    if (!columns.includes(column) || !assetColumnCanFilter(column)) delete assetColumnFilters[column];
+  });
+}
+
+function clearAssetColumnFilters() {
+  Object.keys(assetColumnFilters).forEach((column) => delete assetColumnFilters[column]);
+}
+
+function cellText(valueText) {
+  const text = String(valueText ?? "");
+  return text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function renderEventTable() {
@@ -1570,16 +2236,18 @@ function renderEventInspector() {
   const planningIssues = conflicts.filter((conflict) => !isDoubleBookingConflict(conflict));
   target.hidden = false;
   target.innerHTML = `
-    <div class="inspector-header">
-      <div>
-        <span>${escapeHtml(item.id)}</span>
-        <h3>${escapeHtml(item.name || "Untitled event")}</h3>
+    <div class="inspector-sticky">
+      <div class="inspector-header">
+        <div>
+          <span>${escapeHtml(item.id)}</span>
+          <h3>${escapeHtml(item.name || "Untitled event")}</h3>
+        </div>
+        <button type="button" class="secondary icon-button" data-close-event-inspector aria-label="Close event details">X</button>
       </div>
-      <button type="button" class="secondary icon-button" data-close-event-inspector aria-label="Close event details">X</button>
-    </div>
-    <div class="inspector-actions">
-      <button type="button" data-edit-event="${escapeHtml(item.id)}">Edit Event</button>
-      <button type="button" class="secondary" data-event-report="${escapeHtml(item.id)}">Event Report</button>
+      <div class="inspector-actions">
+        <button type="button" data-edit-event="${escapeHtml(item.id)}">Edit Event</button>
+        <button type="button" class="secondary" data-event-report="${escapeHtml(item.id)}">Event Report</button>
+      </div>
     </div>
     <dl class="detail-list">
       ${detailItem("Category", item.eventCategory || "Test")}
@@ -1701,13 +2369,12 @@ function renderBottlenecks() {
     programs: item.programs,
     totalDays: item.totalDays,
     peakDemand: item.peakDemand,
-    quantity: item.capacity,
     shortage: item.shortage,
     peakDates: item.peakDates,
     affectedPrograms: item.affectedPrograms,
     action: item.action
   }));
-  renderTable("bottleneckTable", ["asset", "assetType", "conflicts", "events", "programs", "totalDays", "peakDemand", "quantity", "shortage", "peakDates", "affectedPrograms", "action"], rows);
+  renderTable("bottleneckTable", ["asset", "assetType", "conflicts", "events", "programs", "totalDays", "peakDemand", "shortage", "peakDates", "affectedPrograms", "action"], rows);
 }
 
 function renderReport() {
@@ -1727,7 +2394,7 @@ function renderReport() {
       ${metric("Conflicts", conflicts.length, `${conflicts.filter((item) => item.severity === "Critical").length} critical`)}
     </div>
     <h3>Highest Demand Assets</h3>
-    ${tableMarkup(["asset", "assetType", "conflicts", "events", "peakDemand", "quantity", "action"], bottlenecks.map((item) => ({ ...item, quantity: item.capacity })))}
+    ${tableMarkup(["asset", "assetType", "conflicts", "events", "peakDemand", "action"], bottlenecks)}
     <h3>Equipment Role Coverage</h3>
     ${tableMarkup(["event", "program", "equipmentRoles"], roleRows)}
     <h3>Event Equipment Review</h3>
@@ -1747,46 +2414,70 @@ function handleAssetSubmit(eventObj) {
   eventObj.stopPropagation();
   const form = new FormData(eventObj.currentTarget);
   const current = state.assets.find((item) => item.id === formValue(form, "id")) || emptyAsset();
-  const assetTypes = readAssetTypesFromForm(eventObj.currentTarget, true);
+  const kind = formValue(form, "assetKind") || "asset";
+  const isOperator = kind === "operator";
+  const isRack = kind === "rack";
+  const isDut = kind === "dut";
+  const isStation = !isOperator && !isRack && !isDut && form.has("isStation");
+  const assetTypes = isOperator ? [TEST_OPERATOR_TYPE] : isDut ? [DUT_TYPE] : isRack ? [RACK_TYPE] : readAssetTypesFromForm(eventObj.currentTarget, true);
   const selectedMemberIds = new Set(formValues(form, "stationGroupMemberIds[]"));
-  if (!assetTypes.length) {
+  const requestedRackName = !isOperator && !isRack && !isDut ? formText(form, "stationGroupName") : "";
+  const existingRackId = rackIdForName(requestedRackName, current.id);
+  const calibrationDueDate = isOperator || isDut || isRack ? "" : formValue(form, "calibrationDueDate");
+  if (!isOperator && !isDut && !isRack && !assetTypes.length) {
     renderAssetTypeRequiredWarning(true);
     document.getElementById("asset-typeEntry")?.focus();
     return;
   }
   const next = {
     ...current,
-    manufacturer: formText(form, "manufacturer"),
+    manufacturer: isOperator || isDut || isRack ? "" : formText(form, "manufacturer"),
     name: formText(form, "name"),
     assetTypes: assetTypes.map((assetType) => rememberEquipmentType(assetType)).filter(Boolean),
     assetType: rememberEquipmentType(assetTypes[0] || ""),
-    stationGroupId: stationGroupOptions(current.id).some((option) => option.value === formValue(form, "stationGroupId")) ? formValue(form, "stationGroupId") : "",
-    quantity: Number(formValue(form, "quantity")) || 1,
-    serialNumber: formText(form, "serialNumber"),
+    stationGroupId: !isDut && !isRack ? existingRackId : "",
+    quantity: 1,
+    serialNumber: isOperator || isRack ? "" : formText(form, "serialNumber"),
     owner: formText(form, "owner"),
     status: formValue(form, "status") || "Available",
-    calibrationRequired: form.has("calibrationRequired"),
-    calibrationDueDate: formValue(form, "calibrationDueDate"),
-    imagePath: formText(form, "imagePath"),
-    imageData: formValue(form, "imageData"),
-    capabilities: formText(form, "capabilities"),
+    calibrationRequired: !isOperator && !isDut && !isRack && (form.has("calibrationRequired") || Boolean(calibrationDueDate)),
+    calibrationDueDate,
+    imagePath: isOperator || isDut || isRack ? "" : formText(form, "imagePath"),
+    imageData: isOperator || isDut || isRack ? "" : formValue(form, "imageData"),
+    capabilities: isOperator || isDut || isRack ? "" : formText(form, "capabilities"),
     notes: formText(form, "notes"),
-    isStation: form.has("isStation"),
-    isOperator: form.has("isOperator")
+    dutType: isDut ? formText(form, "dutType") : "",
+    isStation,
+    isRack,
+    isOperator,
+    isDut
   };
   const duplicateMatches = assetDuplicateMatches(next, current.id);
   if (duplicateMatches.length && !confirm(`${assetDuplicateWarningText(duplicateMatches)}\n\nSave this asset anyway?`)) return;
+  if (requestedRackName && !next.stationGroupId) {
+    next.stationGroupId = createRack(requestedRackName, { owner: next.owner, reservedAssetId: next.id }).id;
+  }
+  if (isDut && next.dutType) {
+    const dependencies = readDutDependenciesFromForm(eventObj.currentTarget).map((dependency) => ({
+      ...dependency,
+      assetType: rememberEquipmentType(dependency.assetType)
+    })).filter((dependency) => dependency.assetType);
+    state.settings.dutTypeDependencies = {
+      ...(state.settings.dutTypeDependencies || {}),
+      [next.dutType]: dependencies
+    };
+  }
   const index = state.assets.findIndex((item) => item.id === next.id);
   if (index >= 0) state.assets[index] = next;
   else state.assets.push(next);
   state.assets = state.assets.map((assetItem) => {
     if (assetItem.id === next.id) return next;
-    const canBeGroupMember = !assetItem.isStation && !assetItem.isOperator;
-    if (next.isStation && canBeGroupMember) {
+    const canBeGroupMember = !assetItem.isRack && !assetItem.isOperator && !assetItem.isDut;
+    if (next.isRack && canBeGroupMember) {
       if (selectedMemberIds.has(assetItem.id)) return { ...assetItem, stationGroupId: next.id };
       if (assetItem.stationGroupId === next.id) return { ...assetItem, stationGroupId: "" };
     }
-    if (!next.isStation && assetItem.stationGroupId === next.id) return { ...assetItem, stationGroupId: "" };
+    if (!next.isRack && assetItem.stationGroupId === next.id) return { ...assetItem, stationGroupId: "" };
     return assetItem;
   });
   assetDrafts.delete(assetDraftKey(selectedAssetId));
@@ -1802,12 +2493,12 @@ function duplicateAsset(assetId) {
   const source = state.assets[sourceIndex];
   if (!source) return;
   saveAssetDraftFromForm();
+  const shouldAssignPlaceholderSerial = assetUsesSerialNumber(source);
   const next = {
     ...JSON.parse(JSON.stringify(source)),
     id: nextId("A", state.assets),
     imageData: "",
-    serialNumber: "",
-    notes: source.notes ? `${source.notes}\nDuplicated from ${source.id}.` : `Duplicated from ${source.id}.`
+    serialNumber: shouldAssignPlaceholderSerial ? nextUndefinedSerial() : ""
   };
   state.assets.splice(sourceIndex + 1, 0, next);
   selectedAssetId = next.id;
@@ -1836,7 +2527,8 @@ function handleEventSubmit(eventObj) {
   const stationIds = new Set(state.assets.filter((item) => item.isStation).map((item) => item.id));
   const operatorIds = new Set(state.assets.filter((item) => item.isOperator).map((item) => item.id));
   const eventCategory = EVENT_CATEGORIES.includes(formValue(form, "eventCategory")) ? formValue(form, "eventCategory") : "Test";
-  const equipmentRoles = eventUsesEquipment(eventCategory) ? readEquipmentRolesFromForm().map((role) => ({
+  const uut = formText(form, "uut");
+  const equipmentRoles = eventUsesEquipment(eventCategory) ? applyDutDependenciesToRoles(readEquipmentRolesFromForm(), dutTypeForUut(eventUsesUut(eventCategory) ? uut : "")).map((role) => ({
     ...role,
     assetType: rememberEquipmentType(role.assetType),
     label: rememberEquipmentType(role.assetType) || role.label,
@@ -1849,7 +2541,6 @@ function handleEventSubmit(eventObj) {
   const startDate = formValue(form, "startDate");
   const endDate = formValue(form, "endDate");
   const program = formText(form, "program");
-  const uut = formText(form, "uut");
   const next = {
     ...current,
     name: formText(form, "name"),
@@ -1934,6 +2625,151 @@ function exportJson() {
   download(`testops-plan-${dateISO(new Date())}.json`, JSON.stringify(state, null, 2), "application/json");
 }
 
+function planJson() {
+  return JSON.stringify(state, null, 2);
+}
+
+function defaultPlanFilename() {
+  return planFileName || `testops-plan-${dateISO(new Date())}.json`;
+}
+
+async function saveJson() {
+  saveState();
+  const filename = defaultPlanFilename();
+  const content = planJson();
+  if ("showSaveFilePicker" in window) {
+    try {
+      if (!planFileHandle && canUseStoredPlanFileHandle) {
+        planFileHandle = await readStoredPlanFileHandle();
+        if (planFileHandle?.name) planFileName = planFileHandle.name;
+      }
+      if (planFileHandle && !(await ensurePlanFilePermission(planFileHandle))) {
+        await forgetPlanFileHandle(false);
+      }
+      if (!planFileHandle) {
+        planFileHandle = await window.showSaveFilePicker({
+          suggestedName: filename,
+          types: [
+            {
+              description: "TestOps JSON plan",
+              accept: { "application/json": [".json"] }
+            }
+          ]
+        });
+      }
+      await writeJsonFile(planFileHandle, content);
+      planFileName = planFileHandle.name || filename;
+      canUseStoredPlanFileHandle = true;
+      await storePlanFileHandle(planFileHandle);
+      showSaveJsonFeedback("Saved");
+      return;
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      await forgetPlanFileHandle(false);
+      alert(`Could not save JSON directly: ${error.message}`);
+      return;
+    }
+  }
+  planFileName = filename;
+  download(filename, content, "application/json");
+  showSaveJsonFeedback("Downloaded");
+}
+
+async function ensurePlanFilePermission(fileHandle) {
+  if (!fileHandle?.queryPermission || !fileHandle?.requestPermission) return true;
+  const options = { mode: "readwrite" };
+  if (await fileHandle.queryPermission(options) === "granted") return true;
+  return await fileHandle.requestPermission(options) === "granted";
+}
+
+async function writeJsonFile(fileHandle, content) {
+  const writable = await fileHandle.createWritable();
+  await writable.write(content);
+  await writable.close();
+}
+
+function showSaveJsonFeedback(text) {
+  const button = document.getElementById("saveJsonBtn");
+  if (!button) return;
+  clearTimeout(saveJsonFeedbackTimer);
+  button.textContent = text;
+  saveJsonFeedbackTimer = setTimeout(() => {
+    button.textContent = "Save JSON";
+  }, 1600);
+}
+
+function openPlanFileDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(PLAN_FILE_DB, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(PLAN_FILE_STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function readStoredPlanFileHandle() {
+  if (!("indexedDB" in window)) return null;
+  try {
+    const db = await openPlanFileDb();
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction(PLAN_FILE_STORE, "readonly");
+      const request = transaction.objectStore(PLAN_FILE_STORE).get(LAST_PLAN_FILE_KEY);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+      transaction.oncomplete = () => db.close();
+      transaction.onerror = () => db.close();
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function storePlanFileHandle(fileHandle) {
+  if (!("indexedDB" in window)) return;
+  try {
+    const db = await openPlanFileDb();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(PLAN_FILE_STORE, "readwrite");
+      transaction.objectStore(PLAN_FILE_STORE).put(fileHandle, LAST_PLAN_FILE_KEY);
+      transaction.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      transaction.onerror = () => {
+        db.close();
+        reject(transaction.error);
+      };
+    });
+  } catch {
+    // Remembering the handle is a convenience; the active save still succeeded.
+  }
+}
+
+async function forgetPlanFileHandle(allowStoredHandle = false) {
+  planFileHandle = null;
+  canUseStoredPlanFileHandle = allowStoredHandle;
+  if (!("indexedDB" in window)) return;
+  try {
+    const db = await openPlanFileDb();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(PLAN_FILE_STORE, "readwrite");
+      transaction.objectStore(PLAN_FILE_STORE).delete(LAST_PLAN_FILE_KEY);
+      transaction.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      transaction.onerror = () => {
+        db.close();
+        reject(transaction.error);
+      };
+    });
+  } catch {
+    // Best effort only; in-memory state is already cleared.
+  }
+}
+
 function exportCsv(kind) {
   const assetsById = byId(state.assets);
   const roleText = (testEvent) => (testEvent.equipmentRoles || []).map((role) => {
@@ -1942,7 +2778,7 @@ function exportCsv(kind) {
     return `${role.label || role.assetType || "Equipment"} (${role.assetType || "any"}${requirement} x${role.quantity || 1}): ${assigned}`;
   }).join("; ");
   const datasets = {
-    assets: state.assets.map(({ imageData, ...assetItem }) => ({ ...assetItem, assetTypes: assetTypeText(assetItem), stationGroup: stationGroupLabel(assetItem.stationGroupId, assetsById), hasPicture: assetImageSource({ ...assetItem, imageData }) ? "Yes" : "No" })),
+    assets: state.assets.map(({ imageData, ...assetItem }) => ({ ...assetItem, assetTypes: assetTypeText(assetItem), rack: stationGroupLabel(assetItem.stationGroupId, assetsById), hasPicture: assetImageSource({ ...assetItem, imageData }) ? "Yes" : "No" })),
     events: state.testEvents.map(({ stationGroupId, operatorAssetId, operatorAssetIds, ...item }) => ({ ...item, operators: operatorNamesForEvent({ ...item, operatorAssetId, operatorAssetIds }, assetsById), equipmentRoles: roleText(item), requiredAssets: fullAssetIds({ ...item, operatorAssetId, operatorAssetIds }).map((id) => assetsById.get(id) ? assetOptionLabel(assetsById.get(id)) : id).join("; ") })),
     conflicts: state.conflicts.filter(isDoubleBookingConflict),
     bottlenecks: computeBottlenecks(),
@@ -2044,14 +2880,20 @@ function saveCurrentEventReport() {
 
 function exportAssetsHtml() {
   const assetTypeFilter = value("assetTypeFilter");
-  const assets = state.assets.filter((item) => assetMatchesType(item, assetTypeFilter));
+  const categoryFilter = value("assetCategoryFilter");
+  const searchFilter = value("assetSearchFilter");
+  const categoryLabel = assetCategoryLabel(categoryFilter);
+  const assetsById = byId(state.assets);
+  const assets = state.assets.filter((item) => assetMatchesType(item, assetTypeFilter) && assetMatchesCategory(item, categoryFilter) && assetMatchesSearch(item, searchFilter, assetsById));
   const body = `
     <section class="hero">
       <p>TestOps Planner</p>
-      <h1>Asset Inventory</h1>
+      <h1>${categoryFilter ? categoryLabel : "Asset Inventory"}</h1>
       <dl>
         ${reportDetail("Assets", assets.length)}
+        ${reportDetail("View", categoryLabel)}
         ${reportDetail("Type Filter", assetTypeFilter || "All types")}
+        ${reportDetail("Search", searchFilter || "None")}
         ${reportDetail("Generated", new Date().toLocaleString())}
       </dl>
     </section>
@@ -2074,11 +2916,11 @@ function assetInventoryCards(assets) {
           ${reportDetail("Type", assetTypeText(assetItem))}
           ${reportDetail("Serial", assetItem.serialNumber)}
           ${reportDetail("Status", assetItem.status)}
-          ${reportDetail("Scheduling Capacity", assetItem.quantity || 1)}
           ${reportDetail("Owner", assetItem.owner)}
           ${reportDetail("Calibration", assetItem.calibrationRequired ? assetItem.calibrationDueDate || "Required" : "Not required")}
           ${reportDetail("Station", assetItem.isStation ? "Yes" : "No")}
-          ${reportDetail("Station Group", stationGroupLabel(assetItem.stationGroupId, assetsById))}
+          ${reportDetail("DUT", assetItem.isDut ? "Yes" : "No")}
+          ${reportDetail("Rack", assetItem.isRack ? `${stationGroupAssets(assetItem.id).length} members` : stationGroupLabel(assetItem.stationGroupId, assetsById))}
           ${reportDetail("Test Operator", assetItem.isOperator ? "Yes" : "No")}
         </dl>
         ${assetItem.capabilities ? `<p>${escapeHtml(assetItem.capabilities)}</p>` : ""}
@@ -2157,6 +2999,8 @@ function importJson(file) {
       selectedAssetId = "";
       selectedEventId = "";
       inspectedEventId = "";
+      forgetPlanFileHandle(false);
+      planFileName = file.name || "";
       assetDrafts.clear();
       eventDrafts.clear();
       refresh();
@@ -2270,14 +3114,17 @@ function removeAssetType(assetType) {
 function readAssetCandidateFromForm(formEl = document.getElementById("assetForm")) {
   if (!formEl) return {};
   const form = new FormData(formEl);
-  const assetTypes = readAssetTypesFromForm(formEl, true);
+  const isOperator = formValue(form, "assetKind") === "operator";
+  const isDut = formValue(form, "assetKind") === "dut";
+  const isRack = formValue(form, "assetKind") === "rack";
+  const assetTypes = isOperator ? [TEST_OPERATOR_TYPE] : isDut ? [DUT_TYPE] : isRack ? [RACK_TYPE] : readAssetTypesFromForm(formEl, true);
   return {
     id: formValue(form, "id"),
-    manufacturer: formText(form, "manufacturer"),
+    manufacturer: isOperator || isDut || isRack ? "" : formText(form, "manufacturer"),
     name: formText(form, "name"),
     assetTypes,
     assetType: assetTypes[0] || "",
-    serialNumber: formText(form, "serialNumber")
+    serialNumber: isOperator || isRack ? "" : formText(form, "serialNumber")
   };
 }
 
@@ -2296,6 +3143,11 @@ function renderAssetTypeRequiredWarning(forceVisible = false) {
   const warningEl = document.getElementById("assetTypeRequiredWarning");
   const formEl = document.getElementById("assetForm");
   if (!warningEl || !formEl) return;
+  if (["operator", "dut", "rack"].includes(formValue(new FormData(formEl), "assetKind"))) {
+    warningEl.hidden = true;
+    document.querySelector(".asset-type-editor")?.classList.remove("field-error");
+    return;
+  }
   const hasAssetType = readAssetTypesFromForm(formEl, true).length > 0;
   warningEl.hidden = hasAssetType || !forceVisible;
   document.querySelector(".asset-type-editor")?.classList.toggle("field-error", !hasAssetType && forceVisible);
@@ -2337,6 +3189,17 @@ document.addEventListener("click", (eventObj) => {
     renderGantt();
     renderEventInspector();
   }
+  const rackOption = eventObj.target.closest("[data-rack-option]");
+  if (rackOption) {
+    selectRackOption(rackOption.dataset.rackOption);
+    return;
+  }
+  if (eventObj.target.closest("[data-toggle-rack-options]")) {
+    const list = document.getElementById("asset-rack-options");
+    setRackOptionsOpen(Boolean(list?.hidden));
+    return;
+  }
+  if (!eventObj.target.closest("[data-rack-combobox]")) setRackOptionsOpen(false);
   const target = eventObj.target.closest("button");
   if (!target) return;
   if (target.type === "submit" && target.closest("form")) return;
@@ -2378,6 +3241,8 @@ document.addEventListener("click", (eventObj) => {
     selectedAssetId = "";
     selectedEventId = "";
     inspectedEventId = "";
+    planFileName = "";
+    forgetPlanFileHandle(false);
     assetDrafts.clear();
     eventDrafts.clear();
     refresh();
@@ -2387,10 +3252,13 @@ document.addEventListener("click", (eventObj) => {
     selectedAssetId = "";
     selectedEventId = "";
     inspectedEventId = "";
+    planFileName = "";
+    forgetPlanFileHandle(false);
     assetDrafts.clear();
     eventDrafts.clear();
     refresh();
   }
+  if (target.id === "saveJsonBtn") saveJson();
   if (target.id === "exportJsonBtn") exportJson();
   if (target.id === "addAssetBtn" || target.id === "addAssetFloatingBtn") {
     selectedAssetId = "";
@@ -2404,6 +3272,18 @@ document.addEventListener("click", (eventObj) => {
   }
   if (target.id === "addAssetTypeBtn") {
     addAssetTypeFromEntry();
+  }
+  if (target.id === "addDutDependencyBtn") {
+    addDutDependency();
+  }
+  if (target.dataset.removeDutDependency) {
+    removeDutDependency(Number(target.dataset.removeDutDependency));
+  }
+  if (target.id === "addRackMemberBtn") {
+    addRackMember();
+  }
+  if (target.dataset.removeRackMember) {
+    removeRackMember(target.dataset.removeRackMember);
   }
   if (target.dataset.removeAssetType) {
     removeAssetType(target.dataset.removeAssetType);
@@ -2499,6 +3379,11 @@ document.getElementById("assetForm").addEventListener("submit", handleAssetSubmi
 document.getElementById("eventForm").addEventListener("submit", handleEventSubmit);
 
 document.addEventListener("keydown", (eventObj) => {
+  if ((eventObj.ctrlKey || eventObj.metaKey) && eventObj.key.toLowerCase() === "s") {
+    eventObj.preventDefault();
+    saveJson();
+    return;
+  }
   if (eventObj.target.id === "asset-typeEntry" && eventObj.key === "Enter") {
     eventObj.preventDefault();
     addAssetTypeFromEntry();
@@ -2534,7 +3419,7 @@ document.addEventListener("keydown", (eventObj) => {
   });
 });
 
-["event-startDate", "event-endDate", "event-stationAssetId"].forEach((id) => {
+["event-startDate", "event-endDate", "event-stationAssetId", "event-uut"].forEach((id) => {
   document.addEventListener("change", (eventObj) => {
     if (eventObj.target.id === id) {
       if (eventObj.target.id === "event-startDate") syncEventEndDateBounds();
@@ -2544,15 +3429,47 @@ document.addEventListener("keydown", (eventObj) => {
 });
 
 document.addEventListener("change", (eventObj) => {
+  if (eventObj.target.id === "assetCategoryFilter") {
+    setValue("assetSearchFilter", "");
+    clearAssetColumnFilters();
+    fillSelect("assetTypeFilter", assetTypeFilterOptions(eventObj.target.value), "All types", "");
+    renderAssetTable();
+  }
   if (eventObj.target.id === "assetTypeFilter") renderAssetTable();
+  if (eventObj.target.dataset.assetColumnFilter) {
+    const column = eventObj.target.dataset.assetColumnFilter;
+    if (eventObj.target.value) assetColumnFilters[column] = eventObj.target.value;
+    else delete assetColumnFilters[column];
+    renderAssetTable();
+  }
+});
+
+document.addEventListener("input", (eventObj) => {
+  if (eventObj.target.id === "assetSearchFilter") renderAssetTable();
+});
+
+document.addEventListener("focusin", (eventObj) => {
+  if (eventObj.target.id === "asset-stationGroupName") setRackOptionsOpen(true);
 });
 
 document.addEventListener("change", (eventObj) => {
   if (!eventObj.target.closest("#assetForm")) return;
+  if (eventObj.target.id === "asset-calibrationDueDate") syncAssetCalibrationRequiredFromDate();
   renderAssetTypeRequiredWarning(false);
   renderAssetDuplicateWarning();
   saveAssetDraftFromForm();
-  if (eventObj.target.id === "asset-isStation") renderAssetForm();
+  if (eventObj.target.name === "dutDependencyAssetType[]") {
+    const dependencies = readDutDependenciesFromForm();
+    renderDutDependenciesFrom(dependencies);
+    saveAssetDraftFromForm();
+    return;
+  }
+  if (eventObj.target.id === "asset-dutType") {
+    const draft = assetDrafts.get(assetDraftKey(selectedAssetId));
+    if (draft) delete draft.dutDependencies;
+    renderAssetForm();
+  }
+  if (eventObj.target.id === "asset-kind") renderAssetForm();
 });
 
 document.addEventListener("change", (eventObj) => {
@@ -2589,6 +3506,8 @@ document.addEventListener("change", (eventObj) => {
 
 document.addEventListener("input", (eventObj) => {
   if (!eventObj.target.closest("#assetForm")) return;
+  if (eventObj.target.id === "asset-stationGroupName") setRackOptionsOpen(true);
+  if (eventObj.target.id === "asset-calibrationDueDate") syncAssetCalibrationRequiredFromDate();
   if (eventObj.target.id === "asset-imagePath") {
     updateAssetImagePath();
     return;
