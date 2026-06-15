@@ -143,6 +143,7 @@
         <div class="panel table-panel">
           <div class="table-actions">
             <h3>Events</h3>
+            <div id="eventColumnPicker" class="column-picker"></div>
             <button id="exportEventsCsvBtn" class="secondary">Export CSV</button>
           </div>
           <div id="eventTable" class="table-wrap"></div>
@@ -202,6 +203,43 @@
           <button class="secondary icon-button" type="button" data-close-modal="event" aria-label="Close event form">X</button>
         </div>
         <form id="eventForm" class="form-grid"></form>
+      </section>
+    </div>
+
+    <div id="rackImportModal" class="modal confirmation-modal" hidden>
+      <div class="modal-backdrop" data-close-rack-import></div>
+      <section class="modal-panel confirmation-panel" role="dialog" aria-modal="true" aria-labelledby="rackImportTitle">
+        <div class="modal-header">
+          <h2 id="rackImportTitle">Import Rack Equipment</h2>
+          <button class="secondary icon-button" type="button" data-close-rack-import aria-label="Cancel rack import">X</button>
+        </div>
+        <div class="confirmation-body">
+          <p id="rackImportSummary"></p>
+          <p class="muted-line">Append keeps the current equipment roles and adds rack equipment that is not already assigned. Replace clears the current role list and uses the rack equipment instead.</p>
+          <div class="form-actions">
+            <button type="button" data-rack-import-mode="append">Append</button>
+            <button type="button" class="secondary" data-rack-import-mode="replace">Replace Existing</button>
+            <button type="button" class="secondary" data-close-rack-import>Cancel</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div id="deleteConfirmModal" class="modal confirmation-modal" hidden>
+      <div class="modal-backdrop" data-close-delete-confirm></div>
+      <section class="modal-panel confirmation-panel" role="dialog" aria-modal="true" aria-labelledby="deleteConfirmTitle">
+        <div class="modal-header">
+          <h2 id="deleteConfirmTitle">Confirm Delete</h2>
+          <button class="secondary icon-button" type="button" data-close-delete-confirm aria-label="Cancel delete">X</button>
+        </div>
+        <div class="confirmation-body">
+          <p id="deleteConfirmSummary"></p>
+          <p id="deleteConfirmDetail" class="muted-line"></p>
+          <div class="form-actions">
+            <button type="button" class="danger-button" data-confirm-delete>Delete</button>
+            <button type="button" class="secondary" data-close-delete-confirm>Cancel</button>
+          </div>
+        </div>
       </section>
     </div>
 

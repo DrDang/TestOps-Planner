@@ -1,6 +1,7 @@
 "use strict";
 
 const STORAGE_KEY = "testops-planner-v2";
+const EVENT_HIDDEN_COLUMNS_KEY = "testops-planner-event-hidden-columns";
 const PLAN_FILE_DB = "testops-planner-file-handles";
 const PLAN_FILE_STORE = "handles";
 const LAST_PLAN_FILE_KEY = "last-json";
@@ -17,7 +18,10 @@ const CATEGORY_COLORS = {
   Maintenance: "#6f6460",
   Outage: "#b83232"
 };
-const DOUBLE_BOOKING_CONFLICT_TYPES = new Set(["Station", "Operator", "Equipment", "UUT"]);
+const DOUBLE_BOOKING_CONFLICT_TYPES = new Set(["Station", "Operator", "Equipment", "Rack", "UUT"]);
+const EVENT_TABLE_COLUMNS = ["id", "category", "name", "program", "uut", "dates", "station", "rack", "operators", "equipment", "priority", "status", "roleStatus", "conflicts", "actions"];
+const EVENT_TABLE_OPTIONAL_COLUMNS = EVENT_TABLE_COLUMNS.filter((column) => column !== "actions");
+const DEFAULT_EVENT_HIDDEN_COLUMNS = ["priority"];
 
 const emptyData = {
   metadata: { name: "Untitled TestOps Plan", updatedAt: new Date().toISOString() },
@@ -69,6 +73,8 @@ let selectedEventId = "";
 let inspectedEventId = "";
 let activeView = "schedule";
 let currentEventReport = null;
+let pendingRackImportId = "";
+let pendingDeleteRequest = null;
 let planFileHandle = null;
 let planFileName = "";
 let canUseStoredPlanFileHandle = true;
@@ -78,18 +84,19 @@ const NEW_EVENT_DRAFT_KEY = "__new_event__";
 const assetDrafts = new Map();
 const NEW_ASSET_DRAFT_KEY = "__new_asset__";
 const assetColumnFilters = {};
+const eventHiddenColumns = new Set(loadEventHiddenColumns());
 const ASSET_COLUMN_EMPTY_FILTER = "__empty__";
 
 function asset(id, name, assetType, isStation, owner, status, quantity, calibrationRequired, calibrationDueDate, imageData = "", stationGroupId = "") {
-  return { id, manufacturer: "", name, assetType, stationGroupId, isStation, isRack: false, isOperator: false, isDut: false, quantity, serialNumber: "", owner, status, calibrationRequired, calibrationDueDate, capabilities: "", imagePath: "", imageData, notes: "" };
+  return { id, manufacturer: "", name, assetType, stationGroupId, isStation, isRack: false, isOperator: false, isDut: false, allowMultiRoleUse: false, quantity, serialNumber: "", owner, status, calibrationRequired, calibrationDueDate, capabilities: "", imagePath: "", imageData, notes: "" };
 }
 
 function event(id, name, program, uut, testType, startDate, endDate, stationAssetId, requiredAssetIds, priority, owner, status, equipmentRoles = [], eventCategory = "Test") {
   return { id, name, eventCategory, program, uut, testType, startDate, endDate, stationAssetId, stationGroupId: "", operatorAssetId: "", operatorAssetIds: [], requiredAssetIds, equipmentRoles, priority, owner, status, notes: "" };
 }
 
-function equipmentRole(id, label, assetType, quantity = 1, assignedAssetIds = [], requirements = "") {
-  return { id, label, assetType, quantity, assignedAssetIds, requirements };
+function equipmentRole(id, label, assetType, quantity = 1, assignedAssetIds = [], requirements = "", rationale = "") {
+  return { id, label, assetType, quantity, assignedAssetIds, requirements, rationale };
 }
 
 function eventUsesUut(eventCategory) {
@@ -112,6 +119,19 @@ function loadState() {
   } catch {
     return structuredClone(emptyData);
   }
+}
+
+function loadEventHiddenColumns() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(EVENT_HIDDEN_COLUMNS_KEY) || "null");
+    return Array.isArray(stored) ? stored.filter((column) => EVENT_TABLE_OPTIONAL_COLUMNS.includes(column)) : DEFAULT_EVENT_HIDDEN_COLUMNS;
+  } catch {
+    return DEFAULT_EVENT_HIDDEN_COLUMNS;
+  }
+}
+
+function saveEventHiddenColumns() {
+  localStorage.setItem(EVENT_HIDDEN_COLUMNS_KEY, JSON.stringify([...eventHiddenColumns]));
 }
 
 function normalizeState(data) {
@@ -141,6 +161,7 @@ function reconcileState(nextState = state) {
       isRack,
       isOperator: Boolean(assetItem.isOperator),
       isDut,
+      allowMultiRoleUse: !isRack && !assetItem.isOperator && !isDut && Boolean(assetItem.allowMultiRoleUse),
       dutType: assetItem.dutType || "",
       assetTypes,
       assetType: assetTypes[0] || "",
@@ -338,7 +359,7 @@ function syncDutAssetsFromUuts(nextState, uutNames) {
 function normalizeEquipmentRoles(roles, legacyEquipmentIds, assetsById) {
   const validAssetIds = new Set(assetsById.keys());
   if (Array.isArray(roles) && roles.length) {
-    return roles.map((role, index) => {
+    return sanitizeEquipmentRoleAssignments(roles.map((role, index) => {
       const quantity = Math.max(1, Number(role.quantity) || 1);
       const incomingAssignedIds = (role.assignedAssetIds || []).filter((assetId) => validAssetIds.has(assetId));
       const firstAssigned = assetsById.get(incomingAssignedIds[0]);
@@ -353,14 +374,33 @@ function normalizeEquipmentRoles(roles, legacyEquipmentIds, assetsById) {
         assetType,
         quantity,
         requirements: String(role.requirements || "").trim(),
+        rationale: String(role.rationale || "").trim(),
         assignedAssetIds
       };
-    });
+    }), assetsById);
   }
-  return legacyEquipmentIds.map((assetId, index) => {
+  return sanitizeEquipmentRoleAssignments(legacyEquipmentIds.map((assetId, index) => {
     const assetItem = assetsById.get(assetId);
     const assetType = assetTypesFor(assetItem)[0] || "";
     return equipmentRole(`R-${String(index + 1).padStart(3, "0")}`, assetType || assetItem?.name || "Equipment", assetType, 1, [assetId]);
+  }), assetsById);
+}
+
+function sanitizeEquipmentRoleAssignments(roles, assetsById = byId(state.assets)) {
+  const usage = new Map();
+  return (roles || []).map((role) => {
+    const quantity = Math.max(1, Number(role.quantity) || 1);
+    const assignedAssetIds = [];
+    (role.assignedAssetIds || []).slice(0, quantity).forEach((assetId) => {
+      const assetItem = assetsById.get(assetId);
+      if (!assetItem || !assetMatchesType(assetItem, role.assetType)) return;
+      const assignedRoleTypes = usage.get(assetId) || new Set();
+      if (assignedRoleTypes.size && !canShareAssetForRole(assetItem, role, assignedRoleTypes)) return;
+      assignedAssetIds.push(assetId);
+      if (!usage.has(assetId)) usage.set(assetId, assignedRoleTypes);
+      assignedRoleTypes.add(String(role.assetType || role.label || "").trim());
+    });
+    return { ...role, quantity, assignedAssetIds };
   });
 }
 
@@ -385,8 +425,49 @@ function dateISO(date) {
   return date.toISOString().slice(0, 10);
 }
 
+function monthStartISO(value) {
+  const date = parseDate(value);
+  return dateISO(new Date(date.getFullYear(), date.getMonth(), 1));
+}
+
+function monthEndISO(value) {
+  const date = parseDate(value);
+  return dateISO(new Date(date.getFullYear(), date.getMonth() + 1, 0));
+}
+
 function daysInclusive(startDate, endDate) {
   return Math.max(1, Math.round((parseDate(endDate) - parseDate(startDate)) / MS_PER_DAY) + 1);
+}
+
+function compactDate(value) {
+  const date = parseDate(value);
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+function compactDateWithoutYear(value) {
+  const date = parseDate(value);
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function compactDateRange(startDate, endDate) {
+  if (!startDate || !endDate) return "";
+  const start = parseDate(startDate);
+  const end = parseDate(endDate);
+  if (startDate === endDate) return compactDate(startDate);
+  if (start.getFullYear() === end.getFullYear()) {
+    if (start.getMonth() === end.getMonth()) {
+      const month = start.toLocaleDateString(undefined, { month: "short" });
+      return `${month} ${start.getDate()}-${end.getDate()}, ${end.getFullYear()}`;
+    }
+    return `${compactDateWithoutYear(startDate)} - ${compactDate(endDate)}`;
+  }
+  return `${compactDate(startDate)} - ${compactDate(endDate)}`;
+}
+
+function eventDateRangeMarkup(startDate, endDate) {
+  const label = compactDateRange(startDate, endDate);
+  const title = `${startDate} to ${endDate}`;
+  return `<span class="event-date-range" title="${escapeHtml(title)}">${escapeHtml(label)}</span>`;
 }
 
 function overlaps(a, b) {
@@ -398,7 +479,7 @@ function overlapRange(a, b) {
 }
 
 function fullAssetIds(testEvent) {
-  return uniqueIds([testEvent.stationAssetId, ...operatorIdsForEvent(testEvent), ...(testEvent.requiredAssetIds || [])]);
+  return uniqueIds([testEvent.stationAssetId, testEvent.stationGroupId, ...operatorIdsForEvent(testEvent), ...(testEvent.requiredAssetIds || [])]);
 }
 
 function roleAssetIds(testEvent) {
@@ -406,10 +487,27 @@ function roleAssetIds(testEvent) {
 }
 
 function assetDemandCount(testEvent, assetId) {
-  const stationDemand = testEvent.stationAssetId === assetId ? 1 : 0;
-  const operatorDemand = operatorIdsForEvent(testEvent).filter((operatorId) => operatorId === assetId).length;
-  const equipmentDemand = roleAssetIds(testEvent).filter((assignedAssetId) => assignedAssetId === assetId).length;
-  return stationDemand + operatorDemand + equipmentDemand;
+  return fullAssetIds(testEvent).includes(assetId) ? 1 : 0;
+}
+
+function eventReservesAsset(testEvent, assetId, assetsById = byId(state.assets)) {
+  if (fullAssetIds(testEvent).includes(assetId)) return true;
+  const assetItem = assetsById.get(assetId);
+  return Boolean(assetItem && testEvent.stationGroupId && assetItem.stationGroupId === testEvent.stationGroupId);
+}
+
+function assetReservationCount(testEvent, assetId, assetsById = byId(state.assets)) {
+  return eventReservesAsset(testEvent, assetId, assetsById) ? 1 : 0;
+}
+
+function eventReservedAssetIds(testEvent, assetsById = byId(state.assets)) {
+  const ids = fullAssetIds(testEvent);
+  if (testEvent.stationGroupId) {
+    assetsById.forEach((assetItem) => {
+      if (assetItem.stationGroupId === testEvent.stationGroupId) ids.push(assetItem.id);
+    });
+  }
+  return uniqueIds(ids);
 }
 
 function roleFillCount(role) {
@@ -674,6 +772,11 @@ function assetOptionLabel(assetItem) {
   return `${displayName}${assetItem.serialNumber ? ` / SN ${assetItem.serialNumber}` : ""}`;
 }
 
+function truncateText(text, maxLength = 90) {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1).trim()}...` : value;
+}
+
 function assetImageMarkup(assetItem, altText = "") {
   if (assetItem?.imagePath) return `<img src="${escapeHtml(assetItem.imagePath)}" alt="${escapeHtml(altText || assetItem.name || "Asset picture")}">`;
   if (assetItem?.imageData) return `<img src="${escapeHtml(assetItem.imageData)}" alt="${escapeHtml(altText || assetItem.name || "Asset picture")}">`;
@@ -687,13 +790,14 @@ function assetImageSource(assetItem) {
 function assetAllocation(assetId, startDate, endDate, currentEventId = "") {
   const assetItem = state.assets.find((item) => item.id === assetId);
   if (!assetItem || !startDate || !endDate) return { level: "open", label: "Check dates", detail: "Set event dates to check allocation." };
+  const assetsById = byId(state.assets);
   const range = { startDate, endDate };
   const overlappingEvents = state.testEvents.filter((testEvent) => {
     if (testEvent.id === currentEventId) return false;
-    return fullAssetIds(testEvent).includes(assetId) && overlaps(testEvent, range);
+    return eventReservesAsset(testEvent, assetId, assetsById) && overlaps(testEvent, range);
   });
   const capacity = Number(assetItem.quantity || 1);
-  const overlappingDemand = overlappingEvents.reduce((sum, testEvent) => sum + assetDemandCount(testEvent, assetId), 0);
+  const overlappingDemand = overlappingEvents.reduce((sum, testEvent) => sum + assetReservationCount(testEvent, assetId, assetsById), 0);
 
   if (BAD_STATUSES.has(assetItem.status)) {
     return { level: "blocked", label: assetItem.status, detail: `Asset status is ${assetItem.status}.` };
@@ -848,6 +952,7 @@ function saveAssetDraftFromForm() {
     status: formValue(form, "status") || "Available",
     calibrationRequired: !isOperator && !isDut && !isRack && (form.has("calibrationRequired") || Boolean(calibrationDueDate)),
     calibrationDueDate,
+    allowMultiRoleUse: !isOperator && !isDut && !isRack && form.has("allowMultiRoleUse"),
     imagePath: isOperator || isDut || isRack ? "" : formText(form, "imagePath"),
     imageData: isOperator || isDut || isRack ? "" : formValue(form, "imageData"),
     capabilities: isOperator || isDut || isRack ? "" : formText(form, "capabilities"),
@@ -871,6 +976,7 @@ function openEventModal() {
 
 function closeEventModal(saveDraft = true) {
   if (saveDraft) saveEventDraftFromForm();
+  closeStationGroupImportConfirmation();
   document.getElementById("eventModal").hidden = true;
 }
 
@@ -887,7 +993,8 @@ function saveEventDraftFromForm() {
   const eventCategory = formValue(form, "eventCategory") || "Test";
   const operatorAssetIds = selectedOperatorIdsFromForm(form);
   const uut = eventUsesUut(eventCategory) ? formText(form, "uut") : "";
-  const equipmentRoles = eventUsesEquipment(eventCategory) ? applyDutDependenciesToRoles(readEquipmentRolesFromForm(), dutTypeForUut(uut)) : [];
+  const usesEquipment = eventUsesEquipment(eventCategory);
+  const equipmentRoles = usesEquipment ? applyDutDependenciesToRoles(readEquipmentRolesFromForm(), dutTypeForUut(uut)) : [];
   eventDrafts.set(eventDraftKey(selectedEventId), {
     id,
     name: formText(form, "name"),
@@ -898,7 +1005,7 @@ function saveEventDraftFromForm() {
     startDate: formValue(form, "startDate"),
     endDate: formValue(form, "endDate"),
     stationAssetId: formValue(form, "stationAssetId"),
-    stationGroupId: "",
+    stationGroupId: usesEquipment ? formValue(form, "stationGroupId") : "",
     operatorAssetId: operatorAssetIds[0] || "",
     operatorAssetIds,
     requiredAssetIds: [],
@@ -939,14 +1046,21 @@ function detectConflicts(events = state.testEvents) {
         });
       }
 
-      const sharedAssets = fullAssetIds(first).filter((assetId) => fullAssetIds(second).includes(assetId));
+      const firstReservedAssets = eventReservedAssetIds(first, assetsById);
+      const secondReservedAssets = eventReservedAssetIds(second, assetsById);
+      const sameReservedRack = first.stationGroupId && first.stationGroupId === second.stationGroupId ? first.stationGroupId : "";
+      const sharedAssets = firstReservedAssets.filter((assetId) => {
+        if (!secondReservedAssets.includes(assetId)) return false;
+        const assetItem = assetsById.get(assetId);
+        return !sameReservedRack || assetId === sameReservedRack || assetItem?.stationGroupId !== sameReservedRack;
+      });
       sharedAssets.forEach((assetId) => {
         const conflictedAsset = assetsById.get(assetId);
         if (!conflictedAsset) return;
         const capacity = Number(conflictedAsset.quantity || 1);
-        const combinedDemand = assetDemandCount(first, assetId) + assetDemandCount(second, assetId);
+        const combinedDemand = assetReservationCount(first, assetId, assetsById) + assetReservationCount(second, assetId, assetsById);
         if (combinedDemand <= capacity) return;
-        const conflictType = conflictedAsset.isStation ? "Station" : conflictedAsset.isOperator ? "Operator" : "Equipment";
+        const conflictType = conflictedAsset.isRack ? "Rack" : conflictedAsset.isStation ? "Station" : conflictedAsset.isOperator ? "Operator" : "Equipment";
         addConflict({
           conflictType,
           assetId,
@@ -956,7 +1070,7 @@ function detectConflicts(events = state.testEvents) {
           programs: [...new Set([first.program, second.program].filter(Boolean))],
           severity: severityFor([first, second], window),
           explanation: `${first.name} and ${second.name} require ${combinedDemand} total use${combinedDemand === 1 ? "" : "s"} of ${conflictedAsset.name} from ${window.startDate} to ${window.endDate}. ${conflictedAsset.name} supports ${capacity} concurrent use${capacity === 1 ? "" : "s"}.`,
-          suggestedResolution: conflictedAsset.isStation ? "Reschedule one event or move an event to another station." : conflictedAsset.isOperator ? "Assign a different qualified operator or reschedule one event." : "Reschedule, substitute another asset, or add another inventory item."
+          suggestedResolution: conflictedAsset.isRack ? "Assign a different rack, remove the rack reservation, or reschedule one event." : conflictedAsset.isStation ? "Reschedule one event or move an event to another station." : conflictedAsset.isOperator ? "Assign a different qualified operator or reschedule one event." : "Reschedule, substitute another asset, or add another inventory item."
         });
       });
     }
@@ -965,12 +1079,12 @@ function detectConflicts(events = state.testEvents) {
   state.assets.forEach((assetItem) => {
     const capacity = Number(assetItem.quantity || 1);
     if (capacity <= 1) return;
-    const usingEvents = events.filter((testEvent) => fullAssetIds(testEvent).includes(assetItem.id));
-    const peak = peakDemand(usingEvents, (testEvent) => assetDemandCount(testEvent, assetItem.id));
+    const usingEvents = events.filter((testEvent) => eventReservesAsset(testEvent, assetItem.id, assetsById));
+    const peak = peakDemand(usingEvents, (testEvent) => assetReservationCount(testEvent, assetItem.id, assetsById));
     if (peak.count <= capacity) return;
     const activeEvents = usingEvents.filter((testEvent) => testEvent.startDate <= peak.dates && testEvent.endDate >= peak.dates);
     addConflict({
-      conflictType: assetItem.isStation ? "Station" : assetItem.isOperator ? "Operator" : "Equipment",
+      conflictType: assetItem.isRack ? "Rack" : assetItem.isStation ? "Station" : assetItem.isOperator ? "Operator" : "Equipment",
       assetId: assetItem.id,
       uut: "",
       startDate: peak.dates,
@@ -1050,8 +1164,9 @@ function severityFor(events, window) {
 
 function computeBottlenecks(events = state.testEvents, conflicts = state.conflicts) {
   const assetEvents = new Map();
+  const assetsById = byId(state.assets);
   events.forEach((testEvent) => {
-    fullAssetIds(testEvent).forEach((assetId) => {
+    eventReservedAssetIds(testEvent, assetsById).forEach((assetId) => {
       if (!assetEvents.has(assetId)) assetEvents.set(assetId, []);
       assetEvents.get(assetId).push(testEvent);
     });
@@ -1062,7 +1177,7 @@ function computeBottlenecks(events = state.testEvents, conflicts = state.conflic
     const relatedConflicts = conflicts.filter((conflict) => conflict.assetId === item.id);
     const programs = new Set(usedBy.map((testEvent) => testEvent.program).filter(Boolean));
     const totalDays = usedBy.reduce((sum, testEvent) => sum + daysInclusive(testEvent.startDate, testEvent.endDate), 0);
-    const peak = peakDemand(usedBy, (testEvent) => assetDemandCount(testEvent, item.id));
+    const peak = peakDemand(usedBy, (testEvent) => assetReservationCount(testEvent, item.id, assetsById));
     const capacity = Number(item.quantity || 1);
     const shortage = Math.max(0, peak.count - capacity);
     const action = shortage > 0 ? "Buy/rent/borrow or reschedule" : relatedConflicts.length ? "Review conflict timing" : usedBy.length >= capacity * 3 ? "Monitor demand" : "No action";
@@ -1227,6 +1342,8 @@ function renderAssetForm() {
           <label>Flags</label>
           <div class="checkbox-row"><input id="asset-isStation" name="isStation" type="checkbox" ${item.isStation ? "checked" : ""}><span>Test Station?</span></div>
           <div class="checkbox-row"><input id="asset-calibrationRequired" name="calibrationRequired" type="checkbox" ${item.calibrationRequired ? "checked" : ""}><span>Calibration Required?</span></div>
+          <div class="checkbox-row"><input id="asset-allowMultiRoleUse" name="allowMultiRoleUse" type="checkbox" ${item.allowMultiRoleUse ? "checked" : ""}><span>Can fill multiple role types in the same event?</span></div>
+          <small>Uses the Asset Types list above. Example: one timing source can fill both 1PPS Source and 10 MHz Source roles.</small>
         </div>
       </div>
       <div class="form-row">
@@ -1291,6 +1408,9 @@ function renderEventForm() {
       ${select("Status", "status", ["Draft", "Planned", "Approved", "In Work", "Complete", "Delayed", "Canceled"], item.status)}
     </div>
     ${eventUsesEquipment(eventCategory) ? `
+    <div class="form-row">
+      ${select("Assigned Rack", "stationGroupId", stationGroups, item.stationGroupId, "No rack")}
+    </div>
     <div class="field">
       <label>Equipment Roles</label>
       ${stationGroupImportControl(stationGroups)}
@@ -1328,7 +1448,7 @@ function refreshEventEquipmentRoles() {
     return;
   }
   const typeOptions = equipmentTypeOptions(roles.map((role) => role.assetType));
-  target.innerHTML = `${equipmentRoleHeader()}${roles.map((role, index) => renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptions)).join("")}<div class="role-add-row">${equipmentRoleAddMarkup("Add Role")}</div>`;
+  target.innerHTML = `${equipmentRoleHeader()}${roles.map((role, index) => renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptions, roles)).join("")}<div class="role-add-row">${equipmentRoleAddMarkup("Add Role")}</div>`;
 }
 
 function emptyEquipmentRolesMarkup() {
@@ -1368,7 +1488,6 @@ function renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptio
   const openSlots = Array.from({ length: quantity }, (_, slotIndex) => assigned[slotIndex] || "");
   const statusClass = assigned.filter(Boolean).length >= quantity ? "ok" : "medium";
   const fillText = quantity === 1 ? assigned.filter(Boolean).length ? "Assigned" : "Open" : `${assigned.filter(Boolean).length}/${quantity}`;
-  const matchText = role.assetType ? `${matchingAssets.length} match${matchingAssets.length === 1 ? "" : "es"}` : "Set type";
   return `
     <section class="equipment-role" data-role-index="${index}">
       <input type="hidden" name="equipmentRoleId[]" value="${escapeHtml(role.id)}">
@@ -1381,9 +1500,13 @@ function renderEquipmentRole(role, index, startDate, endDate, eventId, typeOptio
         ${role.requirements ? `<small class="role-requirement">${escapeHtml(role.requirements)}</small>` : ""}
       </div>
       <div class="role-assignment-cell">
-        ${openSlots.map((assetId, slotIndex) => renderRoleAssignment(role, index, slotIndex, assetId, matchingAssets, startDate, endDate, eventId, assignedEquipmentIdsOutsideSlot(allRoles, index, slotIndex))).join("")}
+        ${openSlots.map((assetId, slotIndex) => renderRoleAssignment(role, index, slotIndex, assetId, matchingAssets, startDate, endDate, eventId, assignedEquipmentUsageOutsideSlot(allRoles, index, slotIndex))).join("")}
       </div>
-      <div class="role-status-cell">${badge(fillText, statusClass)}<small>${escapeHtml(matchText)}</small></div>
+      <div class="field role-rationale-cell">
+        <label class="sr-only" for="role-${index}-rationale">Rationale</label>
+        <textarea id="role-${index}-rationale" name="equipmentRoleRationale[]" placeholder="Why is this role/equipment needed?">${escapeHtml(role.rationale || "")}</textarea>
+      </div>
+      <div class="role-status-cell">${badge(fillText, statusClass)}</div>
       <button type="button" class="secondary icon-button role-remove-button" data-remove-equipment-role="${index}" aria-label="Remove equipment role">X</button>
     </section>
   `;
@@ -1394,49 +1517,96 @@ function equipmentRoleHeader() {
     <div class="role-list-header" aria-hidden="true">
       <span>Type</span>
       <span>Need</span>
-      <span>Qty</span>
-      <span>Assignment</span>
+      <span>Rationale</span>
       <span>Filled</span>
       <span></span>
     </div>
   `;
 }
 
-function assignedEquipmentIdsOutsideSlot(roles, roleIndex, slotIndex) {
-  return new Set((roles || []).flatMap((role, index) => {
+function assignedEquipmentUsageOutsideSlot(roles, roleIndex, slotIndex) {
+  const usage = new Map();
+  (roles || []).forEach((role, index) => {
     const quantity = Math.max(1, Number(role.quantity) || 1);
-    return (role.assignedAssetIds || []).slice(0, quantity).filter((assetId, currentSlotIndex) => {
-      return assetId && (index !== roleIndex || currentSlotIndex !== slotIndex);
+    (role.assignedAssetIds || []).slice(0, quantity).forEach((assetId, currentSlotIndex) => {
+      if (!assetId || (index === roleIndex && currentSlotIndex === slotIndex)) return;
+      if (!usage.has(assetId)) usage.set(assetId, new Set());
+      usage.get(assetId).add(String(role.assetType || role.label || "").trim());
     });
-  }));
+  });
+  return usage;
 }
 
-function renderRoleAssignment(role, roleIndex, slotIndex, assetId, matchingAssets, startDate, endDate, eventId, assignedElsewhere = new Set()) {
+function canShareAssetForRole(assetItem, role, assignedRoleTypes = new Set()) {
+  const roleType = String(role.assetType || "").trim();
+  return Boolean(assetItem?.allowMultiRoleUse && roleType && assetTypesFor(assetItem).includes(roleType) && !assignedRoleTypes.has(roleType));
+}
+
+function roleAssignmentAssetLabel(assetItem, assetsById = byId(state.assets)) {
+  const typeSuffix = assetTypeText(assetItem) ? ` [${assetTypeText(assetItem)}]` : "";
+  const rackName = stationGroupLabel(assetItem.stationGroupId, assetsById) || "No rack";
+  const capabilities = assetItem.capabilities ? ` | Cap: ${truncateText(assetItem.capabilities, 80)}` : "";
+  return `${assetOptionLabel(assetItem)}${typeSuffix} [Rack: ${rackName}]${capabilities}`;
+}
+
+function roleAssetDetailMarkup(assetItem, allocation, assetsById = byId(state.assets)) {
+  if (!assetItem) return "";
+  const rackName = stationGroupLabel(assetItem.stationGroupId, assetsById) || "No rack";
+  const allocationLevel = allocation?.level || "open";
+  const allocationClass = allocationLevel === "open" ? "ok" : allocationLevel === "warning" ? "warning" : "danger";
+  const calibration = assetItem.calibrationRequired ? assetItem.calibrationDueDate || "Required, no due date" : "Not required";
+  return `
+    <dl class="role-asset-detail">
+      <div><dt>Rack</dt><dd>${escapeHtml(rackName)}</dd></div>
+      <div><dt>Types</dt><dd>${escapeHtml(assetTypeText(assetItem) || "No type")}</dd></div>
+      <div><dt>Status</dt><dd>${escapeHtml(assetItem.status || "Unknown")}</dd></div>
+      <div><dt>Availability</dt><dd><span class="detail-status ${allocationClass}">${escapeHtml(allocation?.label || "Available")}</span></dd></div>
+      <div><dt>Calibration</dt><dd>${escapeHtml(calibration)}</dd></div>
+      <div><dt>Capabilities</dt><dd>${escapeHtml(assetItem.capabilities || "No capabilities recorded")}</dd></div>
+      ${assetItem.notes ? `<div><dt>Notes</dt><dd>${escapeHtml(assetItem.notes)}</dd></div>` : ""}
+    </dl>
+  `;
+}
+
+function renderRoleAssignment(role, roleIndex, slotIndex, assetId, matchingAssets, startDate, endDate, eventId, assignmentUsage = new Map()) {
   const selectedAsset = state.assets.find((assetItem) => assetItem.id === assetId);
-  const selectedMatchesRole = selectedAsset && assetMatchesType(selectedAsset, role.assetType);
-  const availableAssets = matchingAssets.filter((assetItem) => assetItem.id === assetId || !assignedElsewhere.has(assetItem.id));
-  const options = availableAssets.some((assetItem) => assetItem.id === assetId) || !selectedMatchesRole ? availableAssets : [selectedAsset, ...availableAssets];
+  const options = matchingAssets.some((assetItem) => assetItem.id === assetId) || !selectedAsset ? matchingAssets : [selectedAsset, ...matchingAssets];
   const selectedAllocation = assetId ? assetAllocation(assetId, startDate, endDate, eventId) : null;
+  const selectedAssignedRoleTypes = assetId ? assignmentUsage.get(assetId) || new Set() : new Set();
+  const sharedInEvent = Boolean(assetId && selectedAssignedRoleTypes.size);
+  const needsAssignment = !assetId;
   const helperText = matchingAssets.length
-    ? selectedAllocation && selectedAllocation.level !== "open" ? selectedAllocation.detail : ""
+    ? sharedInEvent ? "Shared with another role in this event." : selectedAllocation && selectedAllocation.level !== "open" ? selectedAllocation.detail : ""
     : role.assetType
       ? `No inventory assets match ${role.assetType}. Add a matching asset or adjust this role type.`
       : "Set the role type to see matching inventory.";
+  const selectClass = [
+    selectedAllocation && selectedAllocation.level !== "open" ? "allocation-select-warning" : "",
+    needsAssignment ? "assignment-select-needed" : ""
+  ].filter(Boolean).join(" ");
   return `
     <div class="role-assignment">
       <div class="field">
         <label class="sr-only" for="role-${roleIndex}-slot-${slotIndex}">Assignment ${slotIndex + 1}</label>
-        <select id="role-${roleIndex}-slot-${slotIndex}" name="equipmentRoleAssignedAssetIds[]">
+        <select id="role-${roleIndex}-slot-${slotIndex}" class="${selectClass}" name="equipmentRoleAssignedAssetIds[]" data-current-value="${escapeHtml(assetId || "")}">
           <option value="" data-role-index="${roleIndex}">Unassigned ${escapeHtml(role.assetType || "equipment")}</option>
           ${options.map((assetItem) => {
             const allocation = assetAllocation(assetItem.id, startDate, endDate, eventId);
             const status = allocation.level === "open" ? "" : ` (${allocation.label})`;
-            const typeSuffix = assetTypeText(assetItem) ? ` [${assetTypeText(assetItem)}]` : "";
-            return `<option value="${escapeHtml(assetItem.id)}" data-role-index="${roleIndex}" ${assetItem.id === assetId ? "selected" : ""}>${escapeHtml(assetOptionLabel(assetItem))}${escapeHtml(typeSuffix)}${escapeHtml(status)}</option>`;
+            const assignedRoleTypes = assignmentUsage.get(assetItem.id) || new Set();
+            const assignedInThisEvent = assignedRoleTypes.size > 0;
+            const canShare = canShareAssetForRole(assetItem, role, assignedRoleTypes);
+            const sharedSuffix = assignedInThisEvent ? canShare ? " (multi-role available)" : " (assigned in this event)" : "";
+            const hideAssigned = assignedInThisEvent && assetItem.id !== assetId && !canShare ? "hidden" : "";
+            const optionClass = allocation.level === "open" ? "" : "unavailable-option";
+            return `<option value="${escapeHtml(assetItem.id)}" class="${optionClass}" data-role-index="${roleIndex}" ${hideAssigned} ${assetItem.id === assetId ? "selected" : ""}>${escapeHtml(roleAssignmentAssetLabel(assetItem))}${escapeHtml(sharedSuffix)}${escapeHtml(status)}</option>`;
           }).join("")}
         </select>
       </div>
+      ${needsAssignment ? `<span class="assignment-needed-badge">Assignment needed</span>` : ""}
+      ${sharedInEvent ? `<span class="shared-equipment-badge">Shared</span>` : ""}
       ${helperText ? `<small class="${selectedAllocation ? `assignment-${selectedAllocation.level}` : ""}">${escapeHtml(helperText)}</small>` : ""}
+      ${roleAssetDetailMarkup(selectedAsset, selectedAllocation)}
     </div>
   `;
 }
@@ -1522,6 +1692,7 @@ function readEquipmentRolesFromForm() {
   const types = [...formEl.querySelectorAll('[name="equipmentRoleType[]"]')];
   const committedTypes = [...formEl.querySelectorAll('input[name="equipmentRoleCommittedType[]"]')];
   const requirements = [...formEl.querySelectorAll('input[name="equipmentRoleRequirements[]"]')];
+  const rationales = [...formEl.querySelectorAll('[name="equipmentRoleRationale[]"]')];
   const quantities = [...formEl.querySelectorAll('input[name="equipmentRoleQuantity[]"]')];
   const assignmentsByRole = new Map();
   [...formEl.querySelectorAll('select[name="equipmentRoleAssignedAssetIds[]"]')].forEach((selectEl) => {
@@ -1529,17 +1700,14 @@ function readEquipmentRolesFromForm() {
     if (!assignmentsByRole.has(roleIndex)) assignmentsByRole.set(roleIndex, []);
     if (selectEl.value) assignmentsByRole.get(roleIndex).push(selectEl.value);
   });
-  const assignedInEvent = new Set();
-  return roleIds.map((idInput, index) => {
+  return sanitizeEquipmentRoleAssignments(roleIds.map((idInput, index) => {
     const selectedType = types[index]?.value.trim() || "";
     const committedType = committedTypes[index]?.value.trim() || "";
     const assetType = selectedType === "__new_equipment_type__" ? committedType : selectedType || committedType;
     const quantity = Math.max(1, Number(quantities[index]?.value) || 1);
     const assignedAssetIds = (assignmentsByRole.get(index) || []).filter((assetId) => {
       const assetItem = state.assets.find((item) => item.id === assetId);
-      if (!assetItem || !assetMatchesType(assetItem, assetType) || assignedInEvent.has(assetId)) return false;
-      assignedInEvent.add(assetId);
-      return true;
+      return assetItem && assetMatchesType(assetItem, assetType);
     });
     return {
       id: idInput.value || nextRoleId(index),
@@ -1547,9 +1715,10 @@ function readEquipmentRolesFromForm() {
       assetType,
       quantity,
       requirements: requirements[index]?.value.trim() || "",
+      rationale: rationales[index]?.value.trim() || "",
       assignedAssetIds
     };
-  });
+  }));
 }
 
 function readDutDependenciesFromForm(formEl = document.getElementById("assetForm")) {
@@ -1611,19 +1780,77 @@ function removeEquipmentRole(index) {
   renderEquipmentRolesFrom(roles);
 }
 
-function equipmentRolesForStationGroup(stationGroupId) {
-  return stationGroupAssets(stationGroupId).map((assetItem, index) => {
+function highestEquipmentRoleNumber(roles = []) {
+  return roles.reduce((max, role) => Math.max(max, Number(String(role.id || "").replace("R-", "")) || 0), 0);
+}
+
+function equipmentRolesForStationGroup(stationGroupId, { startAt = 0, excludeAssetIds = new Set() } = {}) {
+  return stationGroupAssets(stationGroupId).filter((assetItem) => !excludeAssetIds.has(assetItem.id)).map((assetItem, index) => {
     const assetType = assetTypesFor(assetItem)[0] || assetItem.name || "Equipment";
-    return equipmentRole(`R-${String(index + 1).padStart(3, "0")}`, assetType, assetType, 1, [assetItem.id], assetItem.capabilities || "");
+    return equipmentRole(`R-${String(startAt + index + 1).padStart(3, "0")}`, assetType, assetType, 1, [assetItem.id], assetItem.capabilities || "");
   });
 }
 
-function applyStationGroupToEventForm(stationGroupId) {
+function openStationGroupImportConfirmation(stationGroupId) {
+  const modalEl = document.getElementById("rackImportModal");
+  const summaryEl = document.getElementById("rackImportSummary");
+  if (!modalEl || !summaryEl) return;
+  const rackLabel = stationGroupLabel(stationGroupId) || "this rack";
+  const importCount = stationGroupAssets(stationGroupId).length;
+  pendingRackImportId = stationGroupId;
+  summaryEl.textContent = `Import ${importCount} equipment item${importCount === 1 ? "" : "s"} from ${rackLabel}?`;
+  modalEl.hidden = false;
+  modalEl.querySelector('[data-rack-import-mode="append"]')?.focus();
+}
+
+function closeStationGroupImportConfirmation() {
+  pendingRackImportId = "";
+  document.getElementById("rackImportModal").hidden = true;
+}
+
+function openDeleteConfirmation(kind, id) {
+  const modalEl = document.getElementById("deleteConfirmModal");
+  const summaryEl = document.getElementById("deleteConfirmSummary");
+  const detailEl = document.getElementById("deleteConfirmDetail");
+  if (!modalEl || !summaryEl || !detailEl) return;
+  const item = kind === "asset" ? state.assets.find((assetItem) => assetItem.id === id) : state.testEvents.find((eventItem) => eventItem.id === id);
+  if (!item) return;
+  pendingDeleteRequest = { kind, id };
+  if (kind === "asset") {
+    summaryEl.textContent = `Delete asset "${assetDisplayName(item) || item.name || item.id}"?`;
+    detailEl.textContent = "This will also remove it from rack membership and any event assignments.";
+  } else {
+    summaryEl.textContent = `Delete event "${item.name || item.id}"?`;
+    detailEl.textContent = "This removes the event from the schedule, event table, reports, and conflict calculations.";
+  }
+  modalEl.hidden = false;
+  modalEl.querySelector("[data-confirm-delete]")?.focus();
+}
+
+function closeDeleteConfirmation() {
+  pendingDeleteRequest = null;
+  document.getElementById("deleteConfirmModal").hidden = true;
+}
+
+function confirmPendingDelete() {
+  const request = pendingDeleteRequest;
+  closeDeleteConfirmation();
+  if (!request) return;
+  if (request.kind === "asset") deleteAssetById(request.id);
+  if (request.kind === "event") deleteEventById(request.id);
+}
+
+function applyStationGroupToEventForm(stationGroupId, mode = "replace") {
   const formEl = document.getElementById("eventForm");
   if (!formEl || !eventUsesEquipment(formValue(new FormData(formEl), "eventCategory"))) return;
-  const stationEl = document.getElementById("event-stationAssetId");
-  if (stationEl && [...stationEl.options].some((option) => option.value === stationGroupId)) stationEl.value = stationGroupId;
-  renderEquipmentRolesFrom(equipmentRolesForStationGroup(stationGroupId));
+  const rackEl = document.getElementById("event-stationGroupId");
+  if (rackEl && [...rackEl.options].some((option) => option.value === stationGroupId)) rackEl.value = stationGroupId;
+  const currentRoles = readEquipmentRolesFromForm();
+  const existingAssignments = new Set(currentRoles.flatMap((role) => role.assignedAssetIds || []).filter(Boolean));
+  const importedRoles = mode === "append"
+    ? equipmentRolesForStationGroup(stationGroupId, { startAt: highestEquipmentRoleNumber(currentRoles), excludeAssetIds: existingAssignments })
+    : equipmentRolesForStationGroup(stationGroupId);
+  renderEquipmentRolesFrom(mode === "append" ? [...currentRoles, ...importedRoles] : importedRoles);
   saveEventDraftFromForm();
 }
 
@@ -1911,7 +2138,7 @@ function textarea(labelText, name, textValue) {
 
 function emptyAsset() {
   const next = nextId("A", state.assets);
-  return { id: next, manufacturer: "", name: "", assetType: "", assetTypes: [], stationGroupId: "", isStation: false, isRack: false, isOperator: false, isDut: false, quantity: 1, serialNumber: "", owner: "", status: "Available", calibrationRequired: false, calibrationDueDate: "", capabilities: "", imagePath: "", imageData: "", notes: "" };
+  return { id: next, manufacturer: "", name: "", assetType: "", assetTypes: [], stationGroupId: "", isStation: false, isRack: false, isOperator: false, isDut: false, allowMultiRoleUse: false, quantity: 1, serialNumber: "", owner: "", status: "Available", calibrationRequired: false, calibrationDueDate: "", capabilities: "", imagePath: "", imageData: "", notes: "" };
 }
 
 function emptyEvent() {
@@ -2056,17 +2283,52 @@ function renderEventTable() {
     name: item.name,
     program: item.program,
     uut: item.uut,
-    dates: `${item.startDate} to ${item.endDate}`,
+    dates: eventDateRangeMarkup(item.startDate, item.endDate),
     station: assetsById.get(item.stationAssetId) ? assetDisplayName(assetsById.get(item.stationAssetId)) : "",
+    rack: stationGroupLabel(item.stationGroupId, assetsById),
     operators: operatorNamesForEvent(item, assetsById),
     equipment: roleSummary(item),
     priority: item.priority,
     status: item.status,
     roleStatus: hasUnassignedRoles(item) ? badge("Unassigned", "medium") : badge("Assigned", "ok"),
-    conflicts: doubleBookedEvents.has(item.id) ? badge("Double-booked", "high") : badge("Clear", "ok"),
+    conflicts: doubleBookedEvents.has(item.id) ? conflictLinkBadge(item.id) : badge("Clear", "ok"),
     actions: rowActions("event", item.id)
   }));
-  renderTable("eventTable", ["id", "category", "name", "program", "uut", "dates", "station", "operators", "equipment", "priority", "status", "roleStatus", "conflicts", "actions"], rows);
+  renderEventColumnPicker();
+  renderTable("eventTable", visibleEventTableColumns(), rows);
+}
+
+function conflictLinkBadge(eventId) {
+  return `<button type="button" class="badge high badge-button" data-view-conflicts-for="${escapeHtml(eventId)}">Double-booked</button>`;
+}
+
+function visibleEventTableColumns() {
+  return EVENT_TABLE_COLUMNS.filter((column) => column === "actions" || !eventHiddenColumns.has(column));
+}
+
+function eventColumnLabel(column) {
+  if (column === "uut") return "UUT";
+  if (column === "roleStatus") return "Role Status";
+  return labelize(column);
+}
+
+function renderEventColumnPicker() {
+  const target = document.getElementById("eventColumnPicker");
+  if (!target) return;
+  const visibleCount = EVENT_TABLE_OPTIONAL_COLUMNS.filter((column) => !eventHiddenColumns.has(column)).length;
+  target.innerHTML = `
+    <details class="column-menu">
+      <summary>Columns (${visibleCount}/${EVENT_TABLE_OPTIONAL_COLUMNS.length})</summary>
+      <div class="column-menu-panel">
+        ${EVENT_TABLE_OPTIONAL_COLUMNS.map((column) => `
+          <label>
+            <input type="checkbox" name="eventTableColumn[]" data-event-column="${escapeHtml(column)}" ${eventHiddenColumns.has(column) ? "" : "checked"}>
+            <span>${escapeHtml(eventColumnLabel(column))}</span>
+          </label>
+        `).join("")}
+      </div>
+    </details>
+  `;
 }
 
 function rowActions(kind, id) {
@@ -2091,7 +2353,8 @@ function renderTable(targetId, columns, rows) {
     target.innerHTML = document.getElementById("emptyState").innerHTML;
     return;
   }
-  target.innerHTML = `<table><thead><tr>${columns.map((column) => `<th>${escapeHtml(labelize(column))}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${row[column] ?? ""}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  const labelForColumn = (column) => targetId === "eventTable" ? eventColumnLabel(column) : labelize(column);
+  target.innerHTML = `<table><thead><tr>${columns.map((column) => `<th data-column="${escapeHtml(column)}">${escapeHtml(labelForColumn(column))}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr ${row.__rowAttrs || ""}>${columns.map((column) => `<td data-column="${escapeHtml(column)}">${row[column] ?? ""}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 }
 
 function renderGantt() {
@@ -2106,8 +2369,10 @@ function renderGantt() {
     document.getElementById("gantt").innerHTML = document.getElementById("emptyState").innerHTML;
     return;
   }
-  const start = events.map((item) => item.startDate).sort()[0];
-  const end = events.map((item) => item.endDate).sort().at(-1);
+  const firstEventStart = events.map((item) => item.startDate).sort()[0];
+  const lastEventEnd = events.map((item) => item.endDate).sort().at(-1);
+  const start = monthStartISO(firstEventStart);
+  const end = monthEndISO(lastEventEnd);
   const months = monthSegments(start, end);
   const monthColumns = months.map((month) => `${month.days}fr`).join(" ");
   const totalDays = Math.max(1, Math.round((parseDate(end) - parseDate(start)) / MS_PER_DAY) + 1);
@@ -2211,8 +2476,10 @@ function eventSubtitle(item, assetsById = byId(state.assets)) {
 function eventSubtitleParts(item, assetsById = byId(state.assets)) {
   const stationItem = assetsById.get(item.stationAssetId);
   const station = stationItem ? assetDisplayName(stationItem) : "No station";
+  const rackItem = assetsById.get(item.stationGroupId);
+  const rack = rackItem ? assetDisplayName(rackItem) : "No rack";
   const operators = operatorNamesForEvent(item, assetsById, "No operator");
-  const resources = `${station} / ${operators}`;
+  const resources = `${station} / ${rack} / ${operators}`;
   if (item.eventCategory === "Demo") return { context: `${item.program || "No program"} / ${item.uut || "No demo unit"}`, resources };
   if (item.eventCategory && item.eventCategory !== "Test") return { context: item.eventCategory, resources };
   return { context: `${item.program || "No program"} / ${item.uut || "No UUT"}`, resources };
@@ -2230,6 +2497,7 @@ function renderEventInspector() {
   }
   const assetsById = byId(state.assets);
   const station = assetsById.get(item.stationAssetId);
+  const rack = assetsById.get(item.stationGroupId);
   const operators = operatorNamesForEvent(item, assetsById, "No operator assigned");
   const conflicts = state.conflicts.filter((conflict) => (conflict.eventIds || []).includes(item.id));
   const doubleBookingConflicts = conflicts.filter(isDoubleBookingConflict);
@@ -2256,6 +2524,7 @@ function renderEventInspector() {
       ${item.eventCategory === "Test" ? detailItem("Test Type", item.testType) : ""}
       ${detailItem("Dates", `${item.startDate} to ${item.endDate} (${daysInclusive(item.startDate, item.endDate)} day${daysInclusive(item.startDate, item.endDate) === 1 ? "" : "s"})`)}
       ${detailItem(item.eventCategory === "Test" ? "Station" : item.eventCategory === "Demo" ? "Demo Station" : "Affected Station", station ? assetOptionLabel(station) : "No station assigned")}
+      ${eventUsesEquipment(item.eventCategory || "Test") ? detailItem("Rack", rack ? assetDisplayName(rack) : "No rack assigned") : ""}
       ${detailItem("Test Operators", operators)}
       ${detailItem("Priority", item.priority)}
       ${detailItem("Status", item.status)}
@@ -2346,6 +2615,7 @@ function renderConflictTable() {
   const assetsById = byId(state.assets);
   const eventsById = byId(state.testEvents);
   const rows = state.conflicts.filter(isDoubleBookingConflict).map((item) => ({
+    __rowAttrs: `data-conflict-id="${escapeHtml(item.id)}" data-conflict-events="${escapeHtml(item.eventIds.join(" "))}"`,
     id: item.id,
     type: item.conflictType,
     item: item.assetId ? assetsById.get(item.assetId)?.name || item.assetId : item.uut || "Equipment role",
@@ -2360,8 +2630,17 @@ function renderConflictTable() {
   renderTable("conflictTable", ["id", "type", "item", "dates", "events", "programs", "severity", "explanation", "suggestedResolution", "status"], rows);
 }
 
+function showConflictsForEvent(eventId) {
+  setActiveView("conflicts");
+  renderConflictTable();
+  document.querySelectorAll("#conflictTable tr.conflict-row-highlight").forEach((row) => row.classList.remove("conflict-row-highlight"));
+  const matches = [...document.querySelectorAll("#conflictTable tr[data-conflict-events]")].filter((row) => row.dataset.conflictEvents.split(" ").includes(eventId));
+  matches.forEach((row) => row.classList.add("conflict-row-highlight"));
+  matches[0]?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
 function renderBottlenecks() {
-  const rows = computeBottlenecks().map((item) => ({
+  const rows = computeBottlenecks().filter((item) => item.shortage > 0 || item.conflicts > 0).map((item) => ({
     asset: item.asset,
     assetType: item.assetType,
     conflicts: item.conflicts,
@@ -2442,6 +2721,7 @@ function handleAssetSubmit(eventObj) {
     status: formValue(form, "status") || "Available",
     calibrationRequired: !isOperator && !isDut && !isRack && (form.has("calibrationRequired") || Boolean(calibrationDueDate)),
     calibrationDueDate,
+    allowMultiRoleUse: !isOperator && !isDut && !isRack && form.has("allowMultiRoleUse"),
     imagePath: isOperator || isDut || isRack ? "" : formText(form, "imagePath"),
     imageData: isOperator || isDut || isRack ? "" : formValue(form, "imageData"),
     capabilities: isOperator || isDut || isRack ? "" : formText(form, "capabilities"),
@@ -2518,6 +2798,38 @@ function duplicateAsset(assetId) {
   document.getElementById("asset-serialNumber")?.focus();
 }
 
+function deleteAssetById(deletedAssetId) {
+  state.assets = state.assets.filter((item) => item.id !== deletedAssetId).map((assetItem) => ({
+    ...assetItem,
+    stationGroupId: assetItem.stationGroupId === deletedAssetId ? "" : assetItem.stationGroupId
+  }));
+  state.testEvents = state.testEvents.map((testEvent) => {
+    const operatorAssetIds = operatorIdsForEvent(testEvent).filter((assetId) => assetId !== deletedAssetId);
+    return {
+      ...testEvent,
+      stationAssetId: testEvent.stationAssetId === deletedAssetId ? "" : testEvent.stationAssetId,
+      stationGroupId: testEvent.stationGroupId === deletedAssetId ? "" : testEvent.stationGroupId,
+      operatorAssetId: operatorAssetIds[0] || "",
+      operatorAssetIds,
+      requiredAssetIds: (testEvent.requiredAssetIds || []).filter((assetId) => assetId !== deletedAssetId),
+      equipmentRoles: (testEvent.equipmentRoles || []).map((role) => ({
+        ...role,
+        assignedAssetIds: (role.assignedAssetIds || []).filter((assetId) => assetId !== deletedAssetId)
+      }))
+    };
+  });
+  selectedAssetId = "";
+  refresh();
+}
+
+function deleteEventById(eventId) {
+  state.testEvents = state.testEvents.filter((item) => item.id !== eventId);
+  eventDrafts.delete(eventDraftKey(eventId));
+  if (inspectedEventId === eventId) inspectedEventId = "";
+  selectedEventId = "";
+  refresh();
+}
+
 function handleEventSubmit(eventObj) {
   eventObj.preventDefault();
   eventObj.stopPropagation();
@@ -2536,7 +2848,8 @@ function handleEventSubmit(eventObj) {
   })).filter((role) => role.label || role.assetType || role.assignedAssetIds.length) : [];
   const assignedAssetIds = equipmentRoles.flatMap((role) => role.assignedAssetIds);
   const stationAssetId = stationIds.has(formValue(form, "stationAssetId")) ? formValue(form, "stationAssetId") : "";
-  const stationGroupId = "";
+  const rackIds = new Set(state.assets.filter((item) => item.isRack).map((item) => item.id));
+  const stationGroupId = eventUsesEquipment(eventCategory) && rackIds.has(formValue(form, "stationGroupId")) ? formValue(form, "stationGroupId") : "";
   const operatorAssetIds = selectedOperatorIdsFromForm(form, operatorIds);
   const startDate = formValue(form, "startDate");
   const endDate = formValue(form, "endDate");
@@ -2779,7 +3092,7 @@ function exportCsv(kind) {
   }).join("; ");
   const datasets = {
     assets: state.assets.map(({ imageData, ...assetItem }) => ({ ...assetItem, assetTypes: assetTypeText(assetItem), rack: stationGroupLabel(assetItem.stationGroupId, assetsById), hasPicture: assetImageSource({ ...assetItem, imageData }) ? "Yes" : "No" })),
-    events: state.testEvents.map(({ stationGroupId, operatorAssetId, operatorAssetIds, ...item }) => ({ ...item, operators: operatorNamesForEvent({ ...item, operatorAssetId, operatorAssetIds }, assetsById), equipmentRoles: roleText(item), requiredAssets: fullAssetIds({ ...item, operatorAssetId, operatorAssetIds }).map((id) => assetsById.get(id) ? assetOptionLabel(assetsById.get(id)) : id).join("; ") })),
+    events: state.testEvents.map(({ stationGroupId, operatorAssetId, operatorAssetIds, ...item }) => ({ ...item, rack: stationGroupLabel(stationGroupId, assetsById), operators: operatorNamesForEvent({ ...item, operatorAssetId, operatorAssetIds }, assetsById), equipmentRoles: roleText(item), requiredAssets: fullAssetIds({ ...item, stationGroupId, operatorAssetId, operatorAssetIds }).map((id) => assetsById.get(id) ? assetOptionLabel(assetsById.get(id)) : id).join("; ") })),
     conflicts: state.conflicts.filter(isDoubleBookingConflict),
     bottlenecks: computeBottlenecks(),
     schedule: getGanttEvents()
@@ -2795,6 +3108,7 @@ function exportEventReport(eventId) {
   if (!testEvent) return;
   const assetsById = byId(state.assets);
   const station = assetsById.get(testEvent.stationAssetId);
+  const rack = assetsById.get(testEvent.stationGroupId);
   const operators = operatorNamesForEvent(testEvent, assetsById, "No operator assigned");
   const conflicts = state.conflicts.filter((conflict) => (conflict.eventIds || []).includes(testEvent.id));
   const doubleBookingConflicts = conflicts.filter(isDoubleBookingConflict);
@@ -2809,6 +3123,7 @@ function exportEventReport(eventId) {
         role: role.label || role.assetType || "Equipment role",
         type: role.assetType || "Any type",
         requirement: role.requirements || "",
+        rationale: role.rationale || "",
         slot: index + 1,
         asset: assetItem ? assetOptionLabel(assetItem) : "Unassigned",
         status: assetItem?.status || "",
@@ -2826,15 +3141,16 @@ function exportEventReport(eventId) {
         ${eventUsesUut(testEvent.eventCategory || "Test") ? reportDetail(eventUutLabel(testEvent.eventCategory || "Test"), testEvent.uut) : ""}
         ${reportDetail("Dates", `${testEvent.startDate} to ${testEvent.endDate}`)}
         ${reportDetail("Station", station ? assetOptionLabel(station) : "No station assigned")}
+        ${eventUsesEquipment(testEvent.eventCategory || "Test") ? reportDetail("Rack", rack ? assetDisplayName(rack) : "No rack assigned") : ""}
         ${reportDetail("Test Operators", operators)}
         ${reportDetail("Priority", testEvent.priority)}
         ${reportDetail("Owner", testEvent.owner)}
       </dl>
     </section>
     <h2>Required Equipment Roles</h2>
-    ${tableMarkup(["role", "type", "requirement", "slot", "asset", "status", "calibration", "allocation"], roleRows)}
+    ${tableMarkup(["role", "type", "requirement", "rationale", "slot", "asset", "status", "calibration", "allocation"], roleRows)}
     <h2>Allocated Assets</h2>
-    ${assetInventoryCards(uniqueIds([testEvent.stationAssetId, ...operatorIdsForEvent(testEvent), ...roleAssetIds(testEvent)]).map((assetId) => assetsById.get(assetId)).filter(Boolean))}
+    ${assetInventoryCards(uniqueIds([testEvent.stationAssetId, testEvent.stationGroupId, ...operatorIdsForEvent(testEvent), ...roleAssetIds(testEvent)]).map((assetId) => assetsById.get(assetId)).filter(Boolean))}
     <h2>Resource Conflicts</h2>
     ${reportIssueList(doubleBookingConflicts)}
     <h2>Planning Issues</h2>
@@ -2945,9 +3261,12 @@ function standaloneReportHtml(title, body) {
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)}</title>
   <style>
-    body { color: #1f2933; font-family: Arial, sans-serif; margin: 32px; }
+    * { box-sizing: border-box; }
+    html, body { max-width: 100%; overflow-x: hidden; }
+    body { color: #1f2933; font-family: Arial, sans-serif; margin: 24px; }
     h1, h2 { margin: 0 0 12px; }
     h2 { border-bottom: 1px solid #d8dee4; font-size: 18px; padding-bottom: 6px; }
     .hero { border-bottom: 3px solid #246b5d; margin-bottom: 24px; padding-bottom: 16px; }
@@ -2955,16 +3274,23 @@ function standaloneReportHtml(title, body) {
     dl { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; }
     dt { color: #667085; font-size: 11px; font-weight: 800; text-transform: uppercase; }
     dd { margin: 0; overflow-wrap: anywhere; }
-    table { border-collapse: collapse; margin-bottom: 22px; width: 100%; }
-    th, td { border: 1px solid #d8dee4; padding: 8px; text-align: left; vertical-align: top; }
+    table { border-collapse: collapse; margin-bottom: 22px; table-layout: fixed; width: 100%; }
+    th, td { border: 1px solid #d8dee4; font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; padding: 7px; text-align: left; vertical-align: top; word-break: break-word; }
     th { background: #f4f7f6; }
+    tbody tr:nth-child(even) td { background: #f8faf8; }
+    tbody tr:nth-child(odd) td { background: #fff; }
     .asset-report-grid { display: grid; gap: 14px; }
-    .asset-report-card { border: 1px solid #d8dee4; border-radius: 8px; display: grid; gap: 14px; grid-template-columns: 180px 1fr; padding: 12px; break-inside: avoid; }
+    .asset-report-card { border: 1px solid #d8dee4; border-radius: 8px; display: grid; gap: 14px; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); padding: 12px; break-inside: avoid; max-width: 100%; }
     .asset-report-image { align-items: center; background: #f7f9fb; border: 1px solid #d8dee4; border-radius: 6px; display: flex; justify-content: center; min-height: 130px; overflow: hidden; }
     .asset-report-image img { height: 100%; max-height: 170px; max-width: 100%; object-fit: contain; }
     .asset-report-image span { color: #667085; }
     .issue-list { display: grid; gap: 8px; padding-left: 20px; }
     .issue-list em { color: #667085; display: block; }
+    @media (max-width: 760px) {
+      body { margin: 14px; }
+      dl { grid-template-columns: 1fr; }
+      .asset-report-card { grid-template-columns: 1fr; }
+    }
     @media print { body { margin: 18px; } }
   </style>
 </head>
@@ -3184,6 +3510,18 @@ document.addEventListener("click", (eventObj) => {
     closeImageViewer();
     return;
   }
+  if (eventObj.target.closest("[data-close-event-report]")) {
+    closeEventReportViewer();
+    return;
+  }
+  if (eventObj.target.closest("[data-close-rack-import]")) {
+    closeStationGroupImportConfirmation();
+    return;
+  }
+  if (eventObj.target.closest("[data-close-delete-confirm]")) {
+    closeDeleteConfirmation();
+    return;
+  }
   if (inspectedEventId && activeView === "schedule" && !eventObj.target.closest("#eventInspector") && !eventObj.target.closest("[data-inspect-event]") && !eventObj.target.closest("#eventModal")) {
     inspectedEventId = "";
     renderGantt();
@@ -3219,9 +3557,6 @@ document.addEventListener("click", (eventObj) => {
   if (target.dataset.eventReport) {
     exportEventReport(target.dataset.eventReport);
   }
-  if (target.dataset.closeEventReport !== undefined) {
-    closeEventReportViewer();
-  }
   if (target.id === "printEventReportBtn") {
     printCurrentEventReport();
   }
@@ -3235,6 +3570,9 @@ document.addEventListener("click", (eventObj) => {
   }
   if (target.dataset.view) {
     setActiveView(target.dataset.view);
+  }
+  if (target.dataset.viewConflictsFor) {
+    showConflictsForEvent(target.dataset.viewConflictsFor);
   }
   if (target.id === "sampleBtn") {
     state = structuredClone(sampleData);
@@ -3300,7 +3638,14 @@ document.addEventListener("click", (eventObj) => {
   }
   if (target.id === "importStationGroupBtn") {
     const stationGroupId = value("event-stationGroupImportId");
-    if (stationGroupId) applyStationGroupToEventForm(stationGroupId);
+    if (stationGroupId) openStationGroupImportConfirmation(stationGroupId);
+  }
+  if (target.dataset.rackImportMode) {
+    if (pendingRackImportId) applyStationGroupToEventForm(pendingRackImportId, target.dataset.rackImportMode);
+    closeStationGroupImportConfirmation();
+  }
+  if (target.dataset.confirmDelete !== undefined) {
+    confirmPendingDelete();
   }
   if (target.dataset.addEquipmentType !== undefined) {
     commitInlineEquipmentType(target);
@@ -3327,37 +3672,8 @@ document.addEventListener("click", (eventObj) => {
     duplicateAsset(target.dataset.duplicateAsset);
     return;
   }
-  if (target.dataset.deleteAsset && confirm("Delete this asset? It will also be removed from any event assignments.")) {
-    const deletedAssetId = target.dataset.deleteAsset;
-    state.assets = state.assets.filter((item) => item.id !== deletedAssetId).map((assetItem) => ({
-      ...assetItem,
-      stationGroupId: assetItem.stationGroupId === deletedAssetId ? "" : assetItem.stationGroupId
-    }));
-    state.testEvents = state.testEvents.map((testEvent) => {
-      const operatorAssetIds = operatorIdsForEvent(testEvent).filter((assetId) => assetId !== deletedAssetId);
-      return {
-        ...testEvent,
-        stationAssetId: testEvent.stationAssetId === deletedAssetId ? "" : testEvent.stationAssetId,
-        stationGroupId: testEvent.stationGroupId === deletedAssetId ? "" : testEvent.stationGroupId,
-        operatorAssetId: operatorAssetIds[0] || "",
-        operatorAssetIds,
-        requiredAssetIds: (testEvent.requiredAssetIds || []).filter((assetId) => assetId !== deletedAssetId),
-        equipmentRoles: (testEvent.equipmentRoles || []).map((role) => ({
-          ...role,
-          assignedAssetIds: (role.assignedAssetIds || []).filter((assetId) => assetId !== deletedAssetId)
-        }))
-      };
-    });
-    selectedAssetId = "";
-    refresh();
-  }
-  if (target.dataset.deleteEvent && confirm("Delete this event?")) {
-    state.testEvents = state.testEvents.filter((item) => item.id !== target.dataset.deleteEvent);
-    eventDrafts.delete(eventDraftKey(target.dataset.deleteEvent));
-    if (inspectedEventId === target.dataset.deleteEvent) inspectedEventId = "";
-    selectedEventId = "";
-    refresh();
-  }
+  if (target.dataset.deleteAsset) openDeleteConfirmation("asset", target.dataset.deleteAsset);
+  if (target.dataset.deleteEvent) openDeleteConfirmation("event", target.dataset.deleteEvent);
   if (target.id === "clearFiltersBtn") {
     ["programFilter", "uutFilter", "stationFilter", "ownerFilter", "fromFilter", "toFilter"].forEach((id) => setValue(id, ""));
     refresh();
@@ -3441,6 +3757,13 @@ document.addEventListener("change", (eventObj) => {
     if (eventObj.target.value) assetColumnFilters[column] = eventObj.target.value;
     else delete assetColumnFilters[column];
     renderAssetTable();
+  }
+  if (eventObj.target.dataset.eventColumn) {
+    const column = eventObj.target.dataset.eventColumn;
+    if (eventObj.target.checked) eventHiddenColumns.delete(column);
+    else eventHiddenColumns.add(column);
+    saveEventHiddenColumns();
+    renderEventTable();
   }
 });
 
