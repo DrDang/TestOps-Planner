@@ -1,0 +1,4 @@
+- Get rackmount designations for rackmount items to design rackmounts
+- have a rackmount view based on rack design in tool
+- Have test equipment items numbered in events
+- Have test equipment re-organizable or groupable. Maybe filter options?

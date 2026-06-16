@@ -84,8 +84,10 @@ const NEW_EVENT_DRAFT_KEY = "__new_event__";
 const assetDrafts = new Map();
 const NEW_ASSET_DRAFT_KEY = "__new_asset__";
 const assetColumnFilters = {};
+const conflictColumnFilters = {};
 const eventHiddenColumns = new Set(loadEventHiddenColumns());
 const ASSET_COLUMN_EMPTY_FILTER = "__empty__";
+const CONFLICT_COLUMN_EMPTY_FILTER = "__empty__";
 
 function asset(id, name, assetType, isStation, owner, status, quantity, calibrationRequired, calibrationDueDate, imageData = "", stationGroupId = "") {
   return { id, manufacturer: "", name, assetType, stationGroupId, isStation, isRack: false, isOperator: false, isDut: false, allowMultiRoleUse: false, quantity, serialNumber: "", owner, status, calibrationRequired, calibrationDueDate, capabilities: "", imagePath: "", imageData, notes: "" };
@@ -437,6 +439,11 @@ function monthEndISO(value) {
 
 function daysInclusive(startDate, endDate) {
   return Math.max(1, Math.round((parseDate(endDate) - parseDate(startDate)) / MS_PER_DAY) + 1);
+}
+
+function durationLabel(startDate, endDate) {
+  const days = daysInclusive(startDate, endDate);
+  return `${days} day${days === 1 ? "" : "s"}`;
 }
 
 function compactDate(value) {
@@ -2444,8 +2451,32 @@ function buildGroups(groupBy, events, assetsById) {
 }
 
 function renderLane(group, start, totalDays, monthLines, assetsById, conflictEvents, planningIssueEvents) {
-  const barSlotHeight = 122;
-  const bars = group.events.map((item, index) => {
+  const barTrackGap = 12;
+  const narrowBarThreshold = 12;
+  const trackEndDates = [];
+  const trackHeights = [];
+  const estimateBarHeight = (item, widthPercent, hasBadges, subtitle, dateRange, isNarrow) => {
+    const minimumHeight = hasBadges ? 96 : 76;
+    const estimatedZoneWidth = 780;
+    const barWidthPx = isNarrow ? 260 : Math.max(28, widthPercent / 100 * estimatedZoneWidth);
+    const contentWidthPx = Math.max(14, barWidthPx - (hasBadges ? 28 : 16));
+    const charsPerLine = Math.max(2, Math.floor(contentWidthPx / 7));
+    const textLines = [item.name, subtitle.context, subtitle.resources, dateRange].reduce((sum, text) => {
+      return sum + Math.max(1, Math.ceil(String(text || "").length / charsPerLine));
+    }, 0);
+    const badgeSpace = hasBadges ? 29 : 0;
+    return Math.max(minimumHeight, 20 + badgeSpace + textLines * 16);
+  };
+  const layoutItems = [...group.events].sort((a, b) => a.startDate.localeCompare(b.startDate) || a.endDate.localeCompare(b.endDate)).map((item) => {
+    const eventStart = parseDate(item.startDate);
+    const eventEnd = parseDate(item.endDate);
+    let trackIndex = trackEndDates.findIndex((trackEnd) => eventStart > trackEnd);
+    if (trackIndex === -1) {
+      trackIndex = trackEndDates.length;
+      trackEndDates.push(eventEnd);
+    } else {
+      trackEndDates[trackIndex] = eventEnd;
+    }
     const left = Math.max(0, ((parseDate(item.startDate) - parseDate(start)) / MS_PER_DAY) / totalDays * 100);
     const width = Math.max(2, daysInclusive(item.startDate, item.endDate) / totalDays * 100);
     const color = eventColor(item);
@@ -2453,18 +2484,32 @@ function renderLane(group, start, totalDays, monthLines, assetsById, conflictEve
     const station = stationItem ? assetDisplayName(stationItem) : "No station";
     const hasConflict = conflictEvents.has(item.id);
     const hasPlanningIssue = planningIssueEvents.has(item.id);
-    const top = 10 + index * barSlotHeight;
+    const duration = durationLabel(item.startDate, item.endDate);
     const dateRange = `${item.startDate} to ${item.endDate}`;
+    const scheduleTime = `${dateRange} (${duration})`;
     const badges = [
       hasConflict ? '<span class="bar-badge conflict-badge">Conflict</span>' : "",
       hasPlanningIssue ? '<span class="bar-badge issue-badge">Issue</span>' : ""
     ].filter(Boolean).join("");
     const badgeRail = badges ? `<span class="bar-badge-rail">${badges}</span>` : "";
     const subtitle = eventSubtitleParts(item, assetsById);
-    const fullLabel = `${item.name} / ${subtitle.context} / ${subtitle.resources} / ${dateRange}`;
-    return `<button type="button" class="bar ${item.eventCategory !== "Test" ? "non-test" : ""} ${hasConflict ? "conflict" : ""} ${hasPlanningIssue ? "planning-issue" : ""} ${inspectedEventId === item.id ? "selected" : ""}" data-inspect-event="${escapeHtml(item.id)}" title="${escapeHtml(fullLabel)}" aria-label="${escapeHtml(fullLabel)}" style="left:${left}%;width:${width}%;top:${top}px;background:${color}">${badgeRail}<strong>${escapeHtml(item.name)}</strong><span class="bar-line">${escapeHtml(subtitle.context)}</span><span class="bar-line resource-line">${escapeHtml(subtitle.resources)}</span><em>${escapeHtml(dateRange)}</em></button>`;
+    const isNarrow = width < narrowBarThreshold;
+    const labelSide = isNarrow && left > 72 ? "left" : "right";
+    const barHeight = estimateBarHeight(item, width, Boolean(badges), subtitle, scheduleTime, isNarrow);
+    trackHeights[trackIndex] = Math.max(trackHeights[trackIndex] || 0, barHeight);
+    return { item, left, width, color, hasConflict, hasPlanningIssue, trackIndex, scheduleTime, badgeRail, subtitle, barHeight, isNarrow, labelSide };
+  });
+  const trackTops = [];
+  trackHeights.reduce((top, height, index) => {
+    trackTops[index] = top;
+    return top + height + barTrackGap;
+  }, 10);
+  const bars = layoutItems.map(({ item, left, width, color, hasConflict, hasPlanningIssue, trackIndex, scheduleTime, badgeRail, subtitle, barHeight, isNarrow, labelSide }) => {
+    const top = trackTops[trackIndex] || 10;
+    const fullLabel = `${item.name} / ${subtitle.context} / ${subtitle.resources} / ${scheduleTime}`;
+    return `<button type="button" class="bar ${isNarrow ? `narrow label-${labelSide}` : ""} ${item.eventCategory !== "Test" ? "non-test" : ""} ${hasConflict ? "conflict" : ""} ${hasPlanningIssue ? "planning-issue" : ""} ${inspectedEventId === item.id ? "selected" : ""}" data-inspect-event="${escapeHtml(item.id)}" title="${escapeHtml(fullLabel)}" aria-label="${escapeHtml(fullLabel)}" style="left:${left}%;width:${width}%;top:${top}px;min-height:${barHeight}px;background:${color}">${badgeRail}<span class="bar-content" style="--bar-color:${escapeHtml(color)}"><strong>${escapeHtml(item.name)}</strong><span class="bar-line">${escapeHtml(subtitle.context)}</span><span class="bar-line resource-line">${escapeHtml(subtitle.resources)}</span><em>${escapeHtml(scheduleTime)}</em></span></button>`;
   }).join("");
-  const height = Math.max(86, 28 + group.events.length * barSlotHeight);
+  const height = Math.max(86, 24 + trackHeights.reduce((sum, trackHeight) => sum + trackHeight + barTrackGap, 0));
   return `<div class="lane" style="min-height:${height}px"><div class="lane-label">${escapeHtml(group.label)}<small>${escapeHtml(group.sublabel || `${group.events.length} event${group.events.length === 1 ? "" : "s"}`)}</small></div><div class="bar-zone" style="min-height:${height}px">${monthLines}${bars}</div></div>`;
 }
 
@@ -2522,7 +2567,7 @@ function renderEventInspector() {
       ${detailItem("Program", item.program)}
       ${eventUsesUut(item.eventCategory || "Test") ? detailItem(eventUutLabel(item.eventCategory || "Test"), item.uut) : ""}
       ${item.eventCategory === "Test" ? detailItem("Test Type", item.testType) : ""}
-      ${detailItem("Dates", `${item.startDate} to ${item.endDate} (${daysInclusive(item.startDate, item.endDate)} day${daysInclusive(item.startDate, item.endDate) === 1 ? "" : "s"})`)}
+      ${detailItem("Dates", `${item.startDate} to ${item.endDate} (${durationLabel(item.startDate, item.endDate)})`)}
       ${detailItem(item.eventCategory === "Test" ? "Station" : item.eventCategory === "Demo" ? "Demo Station" : "Affected Station", station ? assetOptionLabel(station) : "No station assigned")}
       ${eventUsesEquipment(item.eventCategory || "Test") ? detailItem("Rack", rack ? assetDisplayName(rack) : "No rack assigned") : ""}
       ${detailItem("Test Operators", operators)}
@@ -2611,9 +2656,225 @@ function eventColor(item) {
   return programColor(item.program);
 }
 
+function recipeTypeForAsset(assetItem) {
+  return assetTypesFor(assetItem).find((assetType) => assetType && assetType !== RACK_TYPE && assetType !== DUT_TYPE && assetType !== TEST_OPERATOR_TYPE) || assetTypeText(assetItem) || assetItem.name || "Equipment";
+}
+
+function rackRecipe(rackId) {
+  const recipeMap = new Map();
+  stationGroupAssets(rackId).forEach((assetItem) => {
+    const type = recipeTypeForAsset(assetItem);
+    const existing = recipeMap.get(type) || { type, required: 0, members: [] };
+    existing.required += 1;
+    existing.members.push(assetItem);
+    recipeMap.set(type, existing);
+  });
+  return [...recipeMap.values()].sort((a, b) => a.type.localeCompare(b.type));
+}
+
+function allocationIsUsable(allocation) {
+  return ["open", "warning", "shared"].includes(allocation?.level);
+}
+
+function resolverAllocation(assetItem, conflict) {
+  return assetAllocation(assetItem.id, conflict.startDate, conflict.endDate);
+}
+
+function rackAvailabilityNote(rackItem, conflict) {
+  const allocation = resolverAllocation(rackItem, conflict);
+  if (allocation.level === "open") return "Rack is open for this window.";
+  return `${allocation.label}${allocation.detail ? `: ${allocation.detail}` : ""}`;
+}
+
+function compatibleAvailableAssets(type, conflict, excludeAssetIds = new Set()) {
+  return state.assets
+    .filter((assetItem) => !assetItem.isRack && !assetItem.isOperator && !assetItem.isDut)
+    .filter((assetItem) => !excludeAssetIds.has(assetItem.id))
+    .filter((assetItem) => assetMatchesType(assetItem, type))
+    .map((assetItem) => ({ assetItem, allocation: resolverAllocation(assetItem, conflict) }))
+    .filter((candidate) => allocationIsUsable(candidate.allocation))
+    .sort((a, b) => {
+      const rackSort = Boolean(a.assetItem.stationGroupId) - Boolean(b.assetItem.stationGroupId);
+      if (rackSort) return rackSort;
+      return assetOptionLabel(a.assetItem).localeCompare(assetOptionLabel(b.assetItem));
+    });
+}
+
+function summarizeAvailableAsset(candidate, assetsById = byId(state.assets)) {
+  const rack = stationGroupLabel(candidate.assetItem.stationGroupId, assetsById);
+  const capability = truncateText(candidate.assetItem.capabilities, 80);
+  return `
+    <div class="resolver-asset-option">
+      <strong>${escapeHtml(assetOptionLabel(candidate.assetItem))}</strong>
+      <span>${escapeHtml(rack ? `Rack: ${rack}` : "No rack")} - ${escapeHtml(candidate.allocation.label)}</span>
+      ${capability ? `<span>${escapeHtml(capability)}</span>` : ""}
+    </div>
+  `;
+}
+
+function rackCandidateScore(rackItem, recipe, conflict) {
+  const rackAllocation = resolverAllocation(rackItem, conflict);
+  const rackUsable = allocationIsUsable(rackAllocation);
+  const availableMembers = stationGroupAssets(rackItem.id)
+    .map((assetItem) => ({ assetItem, allocation: resolverAllocation(assetItem, conflict) }))
+    .filter((candidate) => allocationIsUsable(candidate.allocation));
+  const usedIds = new Set();
+  const coverage = recipe.map((recipeItem) => {
+    const matches = availableMembers.filter((candidate) => !usedIds.has(candidate.assetItem.id) && assetMatchesType(candidate.assetItem, recipeItem.type));
+    matches.slice(0, recipeItem.required).forEach((candidate) => usedIds.add(candidate.assetItem.id));
+    return {
+      type: recipeItem.type,
+      required: recipeItem.required,
+      covered: Math.min(recipeItem.required, matches.length),
+      candidates: matches.slice(0, recipeItem.required)
+    };
+  });
+  const covered = coverage.reduce((sum, item) => sum + item.covered, 0);
+  const required = recipe.reduce((sum, item) => sum + item.required, 0);
+  const missing = Math.max(0, required - covered);
+  return {
+    rackItem,
+    rackAllocation,
+    rackUsable,
+    coverage,
+    covered,
+    required,
+    missing,
+    score: required ? covered / required : 0
+  };
+}
+
+function renderResolverTable(columns, rows) {
+  if (!rows.length) return document.getElementById("emptyState").innerHTML;
+  return `
+    <div class="resolver-table-wrap">
+      <table class="resolver-table">
+        <thead><tr>${columns.map((column) => `<th>${escapeHtml(labelize(column))}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${row[column] ?? ""}</td>`).join("")}</tr>`).join("")}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderRackConflictResolver(conflict) {
+  const assetsById = byId(state.assets);
+  const eventsById = byId(state.testEvents);
+  const rackItem = assetsById.get(conflict.assetId);
+  const recipe = rackRecipe(conflict.assetId);
+  const rackMemberIds = new Set(stationGroupAssets(conflict.assetId).map((assetItem) => assetItem.id));
+  const eventNames = conflict.eventIds.map((eventId) => eventsById.get(eventId)?.name || eventId).join(", ");
+  if (!rackItem) {
+    return `<div class="empty"><h3>Rack not found</h3><p>This conflict references an asset that is no longer in the inventory.</p></div>`;
+  }
+  if (!recipe.length) {
+    return `<div class="empty"><h3>No rack members</h3><p>${escapeHtml(assetDisplayName(rackItem) || rackItem.id)} does not have member equipment to use as a recipe.</p></div>`;
+  }
+
+  const recipeRows = recipe.map((recipeItem) => ({
+    type: escapeHtml(recipeItem.type),
+    required: recipeItem.required,
+    currentRackMembers: recipeItem.members.map((assetItem) => escapeHtml(assetOptionLabel(assetItem))).join("<br>")
+  }));
+
+  const rackCandidates = state.assets
+    .filter((assetItem) => assetItem.isRack && assetItem.id !== conflict.assetId)
+    .map((assetItem) => rackCandidateScore(assetItem, recipe, conflict))
+    .filter((candidate) => candidate.covered > 0 || candidate.rackUsable)
+    .sort((a, b) => b.score - a.score || a.missing - b.missing || assetDisplayName(a.rackItem).localeCompare(assetDisplayName(b.rackItem)))
+    .slice(0, 6);
+
+  const rackRows = rackCandidates.map((candidate) => ({
+    rack: escapeHtml(assetOptionLabel(candidate.rackItem)),
+    coverage: `<strong>${candidate.covered}/${candidate.required}</strong> (${Math.round(candidate.score * 100)}%)`,
+    missing: candidate.coverage.filter((item) => item.covered < item.required).map((item) => `${escapeHtml(item.type)} (${item.required - item.covered})`).join("<br>") || badge("Complete", "ok"),
+    status: `<span class="resolver-status resolver-status-${escapeHtml(candidate.rackAllocation.level)}">${escapeHtml(candidate.rackAllocation.label)}</span>`,
+    notes: escapeHtml(rackAvailabilityNote(candidate.rackItem, conflict))
+  }));
+
+  const poolRows = recipe.map((recipeItem) => {
+    const candidates = compatibleAvailableAssets(recipeItem.type, conflict, rackMemberIds);
+    return {
+      type: escapeHtml(recipeItem.type),
+      need: recipeItem.required,
+      available: candidates.length >= recipeItem.required ? badge(`${candidates.length} available`, "ok") : badge(`${candidates.length} available`, "high"),
+      candidates: candidates.length ? candidates.slice(0, 5).map((candidate) => summarizeAvailableAsset(candidate, assetsById)).join("") : "<span class=\"muted-line\">No available substitutes found.</span>"
+    };
+  });
+
+  return `
+    <div class="resolver-summary">
+      <div>
+        <span class="muted-line">Conflict</span>
+        <strong>${escapeHtml(conflict.id)} - ${escapeHtml(conflict.startDate)} to ${escapeHtml(conflict.endDate)}</strong>
+      </div>
+      <div>
+        <span class="muted-line">Rack</span>
+        <strong>${escapeHtml(assetOptionLabel(rackItem))}</strong>
+      </div>
+      <div>
+        <span class="muted-line">Events</span>
+        <strong>${escapeHtml(eventNames)}</strong>
+      </div>
+    </div>
+    <section class="resolver-section">
+      <h3>Rack Recipe</h3>
+      ${renderResolverTable(["type", "required", "currentRackMembers"], recipeRows)}
+    </section>
+    <details class="resolver-section resolver-collapsible-section">
+      <summary>Best Substitute Racks</summary>
+      ${renderResolverTable(["rack", "coverage", "missing", "status", "notes"], rackRows)}
+    </details>
+    <section class="resolver-section">
+      <h3>Available Equipment Pool</h3>
+      ${renderResolverTable(["type", "need", "available", "candidates"], poolRows)}
+    </section>
+  `;
+}
+
+function renderEquipmentConflictResolver(conflict) {
+  const assetsById = byId(state.assets);
+  const assetItem = assetsById.get(conflict.assetId);
+  const assetType = assetItem ? recipeTypeForAsset(assetItem) : "";
+  const candidates = assetType ? compatibleAvailableAssets(assetType, conflict, new Set([conflict.assetId])) : [];
+  return `
+    <div class="resolver-summary">
+      <div>
+        <span class="muted-line">Conflict</span>
+        <strong>${escapeHtml(conflict.id)} - ${escapeHtml(conflict.startDate)} to ${escapeHtml(conflict.endDate)}</strong>
+      </div>
+      <div>
+        <span class="muted-line">Equipment</span>
+        <strong>${escapeHtml(assetItem ? assetOptionLabel(assetItem) : conflict.assetId || "Equipment")}</strong>
+      </div>
+      <div>
+        <span class="muted-line">Type</span>
+        <strong>${escapeHtml(assetType || "Unknown")}</strong>
+      </div>
+    </div>
+    <section class="resolver-section">
+      <h3>Available Alternatives</h3>
+      ${candidates.length ? `<div class="resolver-option-list">${candidates.slice(0, 12).map((candidate) => summarizeAvailableAsset(candidate, assetsById)).join("")}</div>` : "<p class=\"muted-line\">No available same-type alternatives found for this conflict window.</p>"}
+    </section>
+  `;
+}
+
+function openConflictResolver(conflictId) {
+  const conflict = state.conflicts.find((item) => item.id === conflictId);
+  if (!conflict) return;
+  document.getElementById("conflictResolverTitle").textContent = conflict.conflictType === "Rack" ? "Resolve Rack Conflict" : "Resolve Equipment Conflict";
+  document.getElementById("conflictResolverBody").innerHTML = conflict.conflictType === "Rack" ? renderRackConflictResolver(conflict) : renderEquipmentConflictResolver(conflict);
+  document.getElementById("conflictResolverModal").hidden = false;
+}
+
+function closeConflictResolver() {
+  document.getElementById("conflictResolverModal").hidden = true;
+  document.getElementById("conflictResolverBody").innerHTML = "";
+}
+
 function renderConflictTable() {
   const assetsById = byId(state.assets);
   const eventsById = byId(state.testEvents);
+  const columns = ["id", "type", "item", "dates", "events", "programs", "severity", "explanation", "suggestedResolution", "status", "actions"];
   const rows = state.conflicts.filter(isDoubleBookingConflict).map((item) => ({
     __rowAttrs: `data-conflict-id="${escapeHtml(item.id)}" data-conflict-events="${escapeHtml(item.eventIds.join(" "))}"`,
     id: item.id,
@@ -2625,13 +2886,77 @@ function renderConflictTable() {
     severity: badge(item.severity, item.severity),
     explanation: escapeHtml(item.explanation),
     suggestedResolution: escapeHtml(item.suggestedResolution),
-    status: item.status
+    status: item.status,
+    actions: `<button type="button" class="secondary" data-resolve-conflict="${escapeHtml(item.id)}">Resolve</button>`
   }));
-  renderTable("conflictTable", ["id", "type", "item", "dates", "events", "programs", "severity", "explanation", "suggestedResolution", "status"], rows);
+  pruneConflictColumnFilters(columns);
+  const filteredRows = filterConflictRowsByColumns(rows, columns);
+  const target = document.getElementById("conflictTable");
+  if (!rows.length) {
+    target.innerHTML = document.getElementById("emptyState").innerHTML;
+    return;
+  }
+  const tableHead = `<thead><tr>${columns.map((column) => `<th data-column="${escapeHtml(column)}">${escapeHtml(labelize(column))}</th>`).join("")}</tr>${conflictColumnFilterRow(columns, rows)}</thead>`;
+  if (!filteredRows.length) {
+    target.innerHTML = `<table>${tableHead}</table>${document.getElementById("emptyState").innerHTML}`;
+    return;
+  }
+  target.innerHTML = `<table>${tableHead}<tbody>${filteredRows.map((row) => `<tr ${row.__rowAttrs || ""}>${columns.map((column) => `<td data-column="${escapeHtml(column)}">${row[column] ?? ""}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+}
+
+function conflictColumnFilterRow(columns, rows) {
+  return `<tr class="conflict-column-filter-row">${columns.map((column) => `<th>${conflictColumnCanFilter(column) ? conflictColumnFilterSelect(column, rows) : ""}</th>`).join("")}</tr>`;
+}
+
+function conflictColumnFilterSelect(column, rows) {
+  const selected = conflictColumnFilters[column] || "";
+  const cellValues = rows.flatMap((row) => conflictColumnValues(row, column));
+  const hasEmptyValues = cellValues.some((cellValue) => !cellValue);
+  const options = unique(cellValues);
+  return `
+    <select data-conflict-column-filter="${escapeHtml(column)}" aria-label="Filter ${escapeHtml(labelize(column))}">
+      <option value="">All</option>
+      ${hasEmptyValues ? `<option value="${CONFLICT_COLUMN_EMPTY_FILTER}" ${selected === CONFLICT_COLUMN_EMPTY_FILTER ? "selected" : ""}>Unspecified</option>` : ""}
+      ${options.map((option) => `<option value="${escapeHtml(option)}" ${option === selected ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+    </select>
+  `;
+}
+
+function conflictColumnCanFilter(column) {
+  return !["actions", "explanation", "suggestedResolution"].includes(column);
+}
+
+function conflictColumnValues(row, column) {
+  const text = cellText(row[column]);
+  if (!text) return [""];
+  if (["events", "programs"].includes(column)) return text.split(",").map((item) => item.trim()).filter(Boolean);
+  return [text];
+}
+
+function filterConflictRowsByColumns(rows, columns) {
+  return rows.filter((row) => columns.every((column) => {
+    if (!conflictColumnCanFilter(column)) return true;
+    const filterValue = conflictColumnFilters[column] || "";
+    const cellValues = conflictColumnValues(row, column);
+    if (filterValue === CONFLICT_COLUMN_EMPTY_FILTER) return cellValues.every((cellValue) => !cellValue);
+    const filterText = comparableText(filterValue);
+    return !filterText || cellValues.some((cellValue) => comparableText(cellValue) === filterText);
+  }));
+}
+
+function pruneConflictColumnFilters(columns) {
+  Object.keys(conflictColumnFilters).forEach((column) => {
+    if (!columns.includes(column) || !conflictColumnCanFilter(column)) delete conflictColumnFilters[column];
+  });
+}
+
+function clearConflictColumnFilters() {
+  Object.keys(conflictColumnFilters).forEach((column) => delete conflictColumnFilters[column]);
 }
 
 function showConflictsForEvent(eventId) {
   setActiveView("conflicts");
+  clearConflictColumnFilters();
   renderConflictTable();
   document.querySelectorAll("#conflictTable tr.conflict-row-highlight").forEach((row) => row.classList.remove("conflict-row-highlight"));
   const matches = [...document.querySelectorAll("#conflictTable tr[data-conflict-events]")].filter((row) => row.dataset.conflictEvents.split(" ").includes(eventId));
@@ -3522,6 +3847,10 @@ document.addEventListener("click", (eventObj) => {
     closeDeleteConfirmation();
     return;
   }
+  if (eventObj.target.closest("[data-close-conflict-resolver]")) {
+    closeConflictResolver();
+    return;
+  }
   if (inspectedEventId && activeView === "schedule" && !eventObj.target.closest("#eventInspector") && !eventObj.target.closest("[data-inspect-event]") && !eventObj.target.closest("#eventModal")) {
     inspectedEventId = "";
     renderGantt();
@@ -3573,6 +3902,9 @@ document.addEventListener("click", (eventObj) => {
   }
   if (target.dataset.viewConflictsFor) {
     showConflictsForEvent(target.dataset.viewConflictsFor);
+  }
+  if (target.dataset.resolveConflict) {
+    openConflictResolver(target.dataset.resolveConflict);
   }
   if (target.id === "sampleBtn") {
     state = structuredClone(sampleData);
@@ -3757,6 +4089,12 @@ document.addEventListener("change", (eventObj) => {
     if (eventObj.target.value) assetColumnFilters[column] = eventObj.target.value;
     else delete assetColumnFilters[column];
     renderAssetTable();
+  }
+  if (eventObj.target.dataset.conflictColumnFilter) {
+    const column = eventObj.target.dataset.conflictColumnFilter;
+    if (eventObj.target.value) conflictColumnFilters[column] = eventObj.target.value;
+    else delete conflictColumnFilters[column];
+    renderConflictTable();
   }
   if (eventObj.target.dataset.eventColumn) {
     const column = eventObj.target.dataset.eventColumn;
