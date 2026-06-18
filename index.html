@@ -30,8 +30,10 @@
       <nav class="tabs" aria-label="Planner views">
         <button class="tab active" data-view="schedule">Schedule</button>
         <button class="tab" data-view="assets">Assets</button>
+        <button class="tab" data-view="calibration">Calibration</button>
         <button class="tab" data-view="events">Events</button>
         <button class="tab" data-view="conflicts">Conflicts</button>
+        <button class="tab" data-view="issues">Issues</button>
         <button class="tab" data-view="bottlenecks">Bottlenecks</button>
         <button class="tab" data-view="reports">Reports</button>
       </nav>
@@ -132,6 +134,17 @@
         <button id="addAssetFloatingBtn" class="floating-add-asset">Add Asset</button>
       </section>
 
+      <section id="view-calibration" class="view">
+        <div class="section-heading">
+          <div>
+            <h2>Calibration Due Dates</h2>
+            <p>Equipment with recorded calibration due dates, sorted by earliest due date.</p>
+          </div>
+          <button id="exportCalibrationCsvBtn" class="secondary">Export CSV</button>
+        </div>
+        <div id="calibrationTable" class="panel table-wrap"></div>
+      </section>
+
       <section id="view-events" class="view">
         <div class="section-heading">
           <div>
@@ -154,11 +167,22 @@
         <div class="section-heading">
           <div>
             <h2>Conflict Report</h2>
-            <p>Overlapping station, operator, equipment, UUT, availability, and calibration issues.</p>
+            <p>Overlapping station, operator, equipment, rack, and UUT reservations.</p>
           </div>
           <button id="exportConflictsCsvBtn" class="secondary">Export CSV</button>
         </div>
         <div id="conflictTable" class="panel table-wrap"></div>
+      </section>
+
+      <section id="view-issues" class="view">
+        <div class="section-heading">
+          <div>
+            <h2>Planning Issues</h2>
+            <p>Assignment, availability, and calibration issues tied to test events.</p>
+          </div>
+          <button id="exportIssuesCsvBtn" class="secondary">Export CSV</button>
+        </div>
+        <div id="issueTable" class="panel table-wrap"></div>
       </section>
 
       <section id="view-bottlenecks" class="view">

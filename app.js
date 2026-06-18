@@ -539,6 +539,10 @@ function isDoubleBookingConflict(conflict) {
   return DOUBLE_BOOKING_CONFLICT_TYPES.has(conflict.conflictType) && (conflict.eventIds || []).length > 1;
 }
 
+function isPlanningIssue(conflict) {
+  return !isDoubleBookingConflict(conflict);
+}
+
 function equipmentTypeOptions(extraTypes = []) {
   return unique([
     ...(state.settings.equipmentTypes || []),
@@ -1232,10 +1236,12 @@ function refresh() {
   renderAssetForm();
   renderEventForm();
   renderAssetTable();
+  renderCalibrationTable();
   renderEventTable();
   renderGantt();
   renderEventInspector();
   renderConflictTable();
+  renderIssueTable();
   renderBottlenecks();
   renderReport();
   setActiveView(activeView);
@@ -1283,15 +1289,21 @@ function renderAssetFilterState() {
 
 function renderDashboard() {
   const conflicts = state.conflicts.filter(isDoubleBookingConflict);
+  const planningIssues = state.conflicts.filter(isPlanningIssue);
+  const calibrationRows = calibrationDueRows();
   const bottlenecks = computeBottlenecks(state.testEvents, conflicts);
   const topBottleneck = bottlenecks.find((item) => item.conflicts > 0 || item.shortage > 0);
   const critical = conflicts.filter((item) => item.severity === "Critical").length;
+  const highPlanningIssues = planningIssues.filter((item) => ["Critical", "High"].includes(item.severity)).length;
+  const overdueCalibration = calibrationRows.filter((item) => item.daysUntil < 0).length;
   const stationConflicts = conflicts.filter((item) => item.conflictType === "Station").length;
   const operatorConflicts = conflicts.filter((item) => item.conflictType === "Operator").length;
   document.getElementById("dashboard").innerHTML = [
     metric("Assets", state.assets.length, `${state.assets.filter((item) => item.isStation).length} stations / ${state.assets.filter((item) => item.isOperator).length} operators`),
     metric("Events", state.testEvents.length, `${unique(state.testEvents.map((item) => item.program)).length} programs`),
+    metric("Cal Due Dates", calibrationRows.length, `${overdueCalibration} overdue`),
     metric("Open Conflicts", conflicts.length, `${critical} critical`),
+    metric("Planning Issues", planningIssues.length, `${highPlanningIssues} high priority`),
     metric("Resource Issues", stationConflicts + operatorConflicts, `${stationConflicts} station / ${operatorConflicts} operator`),
     metric("Top Bottleneck", topBottleneck?.asset || "None", topBottleneck ? `${topBottleneck.conflicts} conflicts / ${topBottleneck.shortage} shortage` : "no active bottlenecks")
   ].join("");
@@ -2233,6 +2245,57 @@ function renderAssetTableRows(columns, rows) {
   target.innerHTML = `<table>${tableHead}<tbody>${filteredRows.map((row) => `<tr>${columns.map((column) => `<td>${row[column] ?? ""}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 }
 
+function calibrationDueRows() {
+  const assetsById = byId(state.assets);
+  const today = dateISO(new Date());
+  return state.assets
+    .filter((item) => item.calibrationDueDate)
+    .map((item) => {
+      const daysUntil = Math.round((parseDate(item.calibrationDueDate) - parseDate(today)) / MS_PER_DAY);
+      return {
+        id: item.id,
+        name: assetDisplayName(item) || item.name,
+        type: assetTypeText(item),
+        serial: item.serialNumber,
+        rack: item.isRack ? `${stationGroupAssets(item.id).length} member${stationGroupAssets(item.id).length === 1 ? "" : "s"}` : stationGroupLabel(item.stationGroupId, assetsById),
+        status: item.status,
+        owner: item.owner,
+        calibrationDueDate: item.calibrationDueDate,
+        daysUntil,
+        dueStatus: calibrationDueStatusText(daysUntil)
+      };
+    })
+    .sort((a, b) => a.calibrationDueDate.localeCompare(b.calibrationDueDate) || a.name.localeCompare(b.name));
+}
+
+function calibrationDueStatusText(daysUntil) {
+  if (daysUntil < 0) return `Overdue by ${Math.abs(daysUntil)} day${Math.abs(daysUntil) === 1 ? "" : "s"}`;
+  if (daysUntil === 0) return "Due today";
+  if (daysUntil <= 30) return `Due in ${daysUntil} day${daysUntil === 1 ? "" : "s"}`;
+  return `Current (${daysUntil} days)`;
+}
+
+function calibrationDueStatusBadge(daysUntil) {
+  const level = daysUntil < 0 ? "high" : daysUntil <= 30 ? "medium" : "ok";
+  return badge(calibrationDueStatusText(daysUntil), level);
+}
+
+function renderCalibrationTable() {
+  const rows = calibrationDueRows().map((item) => ({
+    id: item.id,
+    name: item.name,
+    type: item.type,
+    serial: item.serial,
+    rack: item.rack,
+    assetStatus: statusBadge(item.status),
+    calibrationDueDate: item.calibrationDueDate,
+    dueStatus: calibrationDueStatusBadge(item.daysUntil),
+    owner: item.owner,
+    actions: rowActions("asset", item.id)
+  }));
+  renderTable("calibrationTable", ["id", "name", "type", "serial", "rack", "assetStatus", "calibrationDueDate", "dueStatus", "owner", "actions"], rows);
+}
+
 function assetColumnFilterRow(columns, rows) {
   return `<tr class="asset-column-filter-row">${columns.map((column) => `<th>${assetColumnCanFilter(column) ? assetColumnFilterSelect(column, rows) : ""}</th>`).join("")}</tr>`;
 }
@@ -2284,6 +2347,7 @@ function cellText(valueText) {
 function renderEventTable() {
   const assetsById = byId(state.assets);
   const doubleBookedEvents = new Set(state.conflicts.filter(isDoubleBookingConflict).flatMap((item) => item.eventIds));
+  const planningIssueEvents = new Set(state.conflicts.filter(isPlanningIssue).flatMap((item) => item.eventIds));
   const rows = getFilteredEvents().map((item) => ({
     id: item.id,
     category: item.eventCategory || "Test",
@@ -2298,15 +2362,27 @@ function renderEventTable() {
     priority: item.priority,
     status: item.status,
     roleStatus: hasUnassignedRoles(item) ? badge("Unassigned", "medium") : badge("Assigned", "ok"),
-    conflicts: doubleBookedEvents.has(item.id) ? conflictLinkBadge(item.id) : badge("Clear", "ok"),
+    conflicts: eventFindingBadges(item.id, doubleBookedEvents, planningIssueEvents),
     actions: rowActions("event", item.id)
   }));
   renderEventColumnPicker();
   renderTable("eventTable", visibleEventTableColumns(), rows);
 }
 
+function eventFindingBadges(eventId, doubleBookedEvents, planningIssueEvents) {
+  const badges = [
+    doubleBookedEvents.has(eventId) ? conflictLinkBadge(eventId) : "",
+    planningIssueEvents.has(eventId) ? issueLinkBadge(eventId) : ""
+  ].filter(Boolean);
+  return badges.length ? `<div class="finding-badge-list">${badges.join("")}</div>` : badge("Clear", "ok");
+}
+
 function conflictLinkBadge(eventId) {
   return `<button type="button" class="badge high badge-button" data-view-conflicts-for="${escapeHtml(eventId)}">Double-booked</button>`;
+}
+
+function issueLinkBadge(eventId) {
+  return `<button type="button" class="badge medium badge-button" data-view-issues-for="${escapeHtml(eventId)}">Issues</button>`;
 }
 
 function visibleEventTableColumns() {
@@ -2316,6 +2392,7 @@ function visibleEventTableColumns() {
 function eventColumnLabel(column) {
   if (column === "uut") return "UUT";
   if (column === "roleStatus") return "Role Status";
+  if (column === "conflicts") return "Findings";
   return labelize(column);
 }
 
@@ -2370,7 +2447,7 @@ function renderGantt() {
   const events = getGanttEvents(ganttView).sort((a, b) => a.startDate.localeCompare(b.startDate));
   const assetsById = byId(state.assets);
   const conflictEvents = new Set(state.conflicts.filter(isDoubleBookingConflict).flatMap((item) => item.eventIds));
-  const planningIssueEvents = new Set(state.conflicts.filter((item) => !isDoubleBookingConflict(item)).flatMap((item) => item.eventIds));
+  const planningIssueEvents = new Set(state.conflicts.filter(isPlanningIssue).flatMap((item) => item.eventIds));
   document.getElementById("ganttTitle").textContent = ganttView === "calibration" ? "Calibration Events" : labelize(groupBy === "events" ? "event schedule" : `${groupBy} schedule`);
   if (!events.length) {
     document.getElementById("gantt").innerHTML = document.getElementById("emptyState").innerHTML;
@@ -2546,7 +2623,7 @@ function renderEventInspector() {
   const operators = operatorNamesForEvent(item, assetsById, "No operator assigned");
   const conflicts = state.conflicts.filter((conflict) => (conflict.eventIds || []).includes(item.id));
   const doubleBookingConflicts = conflicts.filter(isDoubleBookingConflict);
-  const planningIssues = conflicts.filter((conflict) => !isDoubleBookingConflict(conflict));
+  const planningIssues = conflicts.filter(isPlanningIssue);
   target.hidden = false;
   target.innerHTML = `
     <div class="inspector-sticky">
@@ -2960,6 +3037,44 @@ function showConflictsForEvent(eventId) {
   renderConflictTable();
   document.querySelectorAll("#conflictTable tr.conflict-row-highlight").forEach((row) => row.classList.remove("conflict-row-highlight"));
   const matches = [...document.querySelectorAll("#conflictTable tr[data-conflict-events]")].filter((row) => row.dataset.conflictEvents.split(" ").includes(eventId));
+  matches.forEach((row) => row.classList.add("conflict-row-highlight"));
+  matches[0]?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function renderIssueTable() {
+  const assetsById = byId(state.assets);
+  const eventsById = byId(state.testEvents);
+  const columns = ["id", "type", "event", "category", "program", "uut", "dates", "item", "severity", "explanation", "suggestedResolution", "status", "actions"];
+  const rows = state.conflicts.filter(isPlanningIssue).map((item) => {
+    const events = (item.eventIds || []).map((eventId) => eventsById.get(eventId)).filter(Boolean);
+    const eventNames = (item.eventIds || []).map((eventId) => eventsById.get(eventId)?.name || eventId).join(", ");
+    const primaryEvent = events[0];
+    const assetItem = item.assetId ? assetsById.get(item.assetId) : null;
+    return {
+      __rowAttrs: `data-issue-id="${escapeHtml(item.id)}" data-issue-events="${escapeHtml((item.eventIds || []).join(" "))}"`,
+      id: item.id,
+      type: item.conflictType,
+      event: eventNames,
+      category: unique(events.map((eventItem) => eventItem.eventCategory || "Test")).join(", ") || primaryEvent?.eventCategory || "",
+      program: item.programs?.join(", ") || unique(events.map((eventItem) => eventItem.program)).join(", "),
+      uut: item.uut || unique(events.map((eventItem) => eventItem.uut)).join(", "),
+      dates: `${item.startDate} to ${item.endDate}`,
+      item: assetItem ? assetOptionLabel(assetItem) : item.uut || "Equipment role",
+      severity: badge(item.severity, item.severity === "Critical" ? "high" : item.severity),
+      explanation: escapeHtml(item.explanation),
+      suggestedResolution: escapeHtml(item.suggestedResolution),
+      status: item.status,
+      actions: primaryEvent ? `<div class="row-actions"><button type="button" class="secondary" data-edit-event="${escapeHtml(primaryEvent.id)}">Edit Event</button><button type="button" class="secondary" data-event-report="${escapeHtml(primaryEvent.id)}">Report</button></div>` : ""
+    };
+  });
+  renderTable("issueTable", columns, rows);
+}
+
+function showIssuesForEvent(eventId) {
+  setActiveView("issues");
+  renderIssueTable();
+  document.querySelectorAll("#issueTable tr.conflict-row-highlight").forEach((row) => row.classList.remove("conflict-row-highlight"));
+  const matches = [...document.querySelectorAll("#issueTable tr[data-issue-events]")].filter((row) => row.dataset.issueEvents.split(" ").includes(eventId));
   matches.forEach((row) => row.classList.add("conflict-row-highlight"));
   matches[0]?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
@@ -3419,6 +3534,8 @@ function exportCsv(kind) {
     assets: state.assets.map(({ imageData, ...assetItem }) => ({ ...assetItem, assetTypes: assetTypeText(assetItem), rack: stationGroupLabel(assetItem.stationGroupId, assetsById), hasPicture: assetImageSource({ ...assetItem, imageData }) ? "Yes" : "No" })),
     events: state.testEvents.map(({ stationGroupId, operatorAssetId, operatorAssetIds, ...item }) => ({ ...item, rack: stationGroupLabel(stationGroupId, assetsById), operators: operatorNamesForEvent({ ...item, operatorAssetId, operatorAssetIds }, assetsById), equipmentRoles: roleText(item), requiredAssets: fullAssetIds({ ...item, stationGroupId, operatorAssetId, operatorAssetIds }).map((id) => assetsById.get(id) ? assetOptionLabel(assetsById.get(id)) : id).join("; ") })),
     conflicts: state.conflicts.filter(isDoubleBookingConflict),
+    issues: issueCsvRows(assetsById),
+    calibration: calibrationDueCsvRows(),
     bottlenecks: computeBottlenecks(),
     schedule: getGanttEvents()
   };
@@ -3426,6 +3543,45 @@ function exportCsv(kind) {
   const columns = rows.length ? Object.keys(rows[0]) : [];
   const csv = [columns.join(","), ...rows.map((row) => columns.map((column) => csvCell(row[column])).join(","))].join("\n");
   download(`testops-${kind}-${dateISO(new Date())}.csv`, csv, "text/csv");
+}
+
+function calibrationDueCsvRows() {
+  return calibrationDueRows().map((item) => ({
+    id: item.id,
+    name: item.name,
+    type: item.type,
+    serial: item.serial,
+    rack: item.rack,
+    assetStatus: item.status,
+    calibrationDueDate: item.calibrationDueDate,
+    daysUntilDue: item.daysUntil,
+    dueStatus: item.dueStatus,
+    owner: item.owner
+  }));
+}
+
+function issueCsvRows(assetsById = byId(state.assets)) {
+  const eventsById = byId(state.testEvents);
+  return state.conflicts.filter(isPlanningIssue).map((item) => {
+    const events = (item.eventIds || []).map((eventId) => eventsById.get(eventId)).filter(Boolean);
+    const assetItem = item.assetId ? assetsById.get(item.assetId) : null;
+    return {
+      id: item.id,
+      type: item.conflictType,
+      eventIds: (item.eventIds || []).join("; "),
+      events: (item.eventIds || []).map((eventId) => eventsById.get(eventId)?.name || eventId).join("; "),
+      categories: unique(events.map((eventItem) => eventItem.eventCategory || "Test")).join("; "),
+      programs: (item.programs || []).join("; "),
+      uut: item.uut || unique(events.map((eventItem) => eventItem.uut)).join("; "),
+      startDate: item.startDate,
+      endDate: item.endDate,
+      item: assetItem ? assetOptionLabel(assetItem) : item.uut || "Equipment role",
+      severity: item.severity,
+      explanation: item.explanation,
+      suggestedResolution: item.suggestedResolution,
+      status: item.status
+    };
+  });
 }
 
 function exportEventReport(eventId) {
@@ -3437,7 +3593,7 @@ function exportEventReport(eventId) {
   const operators = operatorNamesForEvent(testEvent, assetsById, "No operator assigned");
   const conflicts = state.conflicts.filter((conflict) => (conflict.eventIds || []).includes(testEvent.id));
   const doubleBookingConflicts = conflicts.filter(isDoubleBookingConflict);
-  const planningIssues = conflicts.filter((conflict) => !isDoubleBookingConflict(conflict));
+  const planningIssues = conflicts.filter(isPlanningIssue);
   const roleRows = (testEvent.equipmentRoles || []).flatMap((role) => {
     const quantity = Math.max(1, Number(role.quantity) || 1);
     const assignments = [...(role.assignedAssetIds || []), ...Array.from({ length: Math.max(0, quantity - (role.assignedAssetIds || []).length) }, () => "")].slice(0, quantity);
@@ -3903,6 +4059,9 @@ document.addEventListener("click", (eventObj) => {
   if (target.dataset.viewConflictsFor) {
     showConflictsForEvent(target.dataset.viewConflictsFor);
   }
+  if (target.dataset.viewIssuesFor) {
+    showIssuesForEvent(target.dataset.viewIssuesFor);
+  }
   if (target.dataset.resolveConflict) {
     openConflictResolver(target.dataset.resolveConflict);
   }
@@ -4017,8 +4176,10 @@ document.addEventListener("click", (eventObj) => {
   if (target.id === "printBtn") window.print();
   if (target.id === "exportAssetsCsvBtn") exportCsv("assets");
   if (target.id === "exportAssetsHtmlBtn") exportAssetsHtml();
+  if (target.id === "exportCalibrationCsvBtn") exportCsv("calibration");
   if (target.id === "exportEventsCsvBtn") exportCsv("events");
   if (target.id === "exportConflictsCsvBtn") exportCsv("conflicts");
+  if (target.id === "exportIssuesCsvBtn") exportCsv("issues");
   if (target.id === "exportBottlenecksCsvBtn") exportCsv("bottlenecks");
   if (target.id === "exportScheduleCsvBtn") exportCsv("schedule");
 });

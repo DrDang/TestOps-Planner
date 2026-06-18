@@ -1485,20 +1485,25 @@ th {
 }
 
 #assetTable tbody tr:nth-child(even) td,
+#calibrationTable tbody tr:nth-child(even) td,
 #eventTable tbody tr:nth-child(even) td,
 #conflictTable tbody tr:nth-child(even) td,
+#issueTable tbody tr:nth-child(even) td,
 #bottleneckTable tbody tr:nth-child(even) td {
   background: #f8faf8;
 }
 
 #assetTable tbody tr:nth-child(odd) td,
+#calibrationTable tbody tr:nth-child(odd) td,
 #eventTable tbody tr:nth-child(odd) td,
 #conflictTable tbody tr:nth-child(odd) td,
+#issueTable tbody tr:nth-child(odd) td,
 #bottleneckTable tbody tr:nth-child(odd) td {
   background: #fff;
 }
 
-#conflictTable tr.conflict-row-highlight td {
+#conflictTable tr.conflict-row-highlight td,
+#issueTable tr.conflict-row-highlight td {
   background: #fff0d4 !important;
   box-shadow: inset 4px 0 0 var(--warn);
 }
@@ -1581,6 +1586,13 @@ tr:hover td {
 .badge-button:focus-visible {
   outline: 2px solid rgba(184, 50, 50, 0.25);
   outline-offset: 2px;
+}
+
+.finding-badge-list {
+  align-items: flex-start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .badge.critical,
@@ -2188,11 +2200,13 @@ tr:hover td {
   .tabs,
   .toolbar,
   .section-heading button,
-  #view-schedule,
-  #view-assets,
-  #view-events,
-  #view-conflicts,
-  #view-bottlenecks {
+#view-schedule,
+#view-assets,
+#view-calibration,
+#view-events,
+#view-conflicts,
+#view-issues,
+#view-bottlenecks {
     display: none !important;
   }
 
